@@ -24,6 +24,8 @@ Usage:
 """
 
 import time
+import copy
+from collections import deque
 import numpy as np
 
 from prepare import (
@@ -32,6 +34,7 @@ from prepare import (
     EpisodeResult,
     TIME_BUDGET,
     NUM_PUBLIC_TASKS,
+    _state_name,
 )
 
 from modules.perception    import Perception
@@ -131,6 +134,10 @@ class Agent:
         goal_grid = self._infer_goal(env, state, similar)
         if goal_grid is not None:
             self.goal_inf.set_goal(goal_grid)
+        else:
+            planned = self._run_local_search_plan(spec, env, state, t_start)
+            if planned is not None:
+                return planned
 
         goal_reached = self.goal_inf.goal_reached(state)
         program_done = False
@@ -233,6 +240,94 @@ class Agent:
         except Exception:
             pass
         return None
+
+    def _run_local_search_plan(self, spec, env, state, t_start: float) -> EpisodeResult | None:
+        raw_env = getattr(env, "raw_env", None)
+        actions = list(getattr(raw_env, "action_space", []) or [])
+        if raw_env is None or not actions:
+            return None
+
+        simple_actions = [
+            action for action in actions
+            if not (callable(getattr(action, "is_complex", None)) and action.is_complex())
+        ]
+        if not simple_actions:
+            return None
+
+        start_levels = int(getattr(env.last_obs, "levels_completed", 0) or 0)
+        plan = self._find_level_plan(raw_env, simple_actions, start_levels)
+        if not plan:
+            return None
+
+        by_name = {getattr(action, "name", ""): action for action in actions}
+        goal_reached = False
+        for name in plan:
+            if time.monotonic() - t_start > TIME_BUDGET:
+                break
+            if self.loop.budget_exhausted(env.actions_taken, env.action_budget):
+                break
+            action = by_name.get(name)
+            if action is None:
+                break
+            obs = raw_env.step(action)
+            env.actions_taken += 1
+            env.last_obs = obs
+            if int(getattr(obs, "levels_completed", 0) or 0) > start_levels:
+                goal_reached = True
+                break
+
+        ep = Episode(
+            task_id=spec.task_id,
+            trajectory=[],
+            outcome=goal_reached,
+            rhae=0.0,
+            fingerprint=state.grid.flatten().astype(float),
+        )
+        self.memory.store(ep)
+        return EpisodeResult(spec.task_id, env.actions_taken, goal_reached, 0.0)
+
+    def _find_level_plan(self, raw_env, actions, start_levels: int) -> list[str] | None:
+        max_depth = 40
+        max_nodes = 1800
+        queue = deque([(copy.deepcopy(raw_env), [])])
+        seen = set()
+        nodes = 0
+
+        while queue and nodes < max_nodes:
+            current, plan = queue.popleft()
+            nodes += 1
+            key = self._local_state_key(current)
+            if key in seen:
+                continue
+            seen.add(key)
+            if len(plan) >= max_depth:
+                continue
+
+            for action in actions:
+                try:
+                    nxt = copy.deepcopy(current)
+                    obs = nxt.step(action)
+                except Exception:
+                    continue
+                new_plan = plan + [getattr(action, "name", str(action))]
+                levels_completed = int(getattr(obs, "levels_completed", 0) or 0)
+                if levels_completed > start_levels:
+                    return new_plan
+                if _state_name(obs) == "NOT_FINISHED":
+                    queue.append((nxt, new_plan))
+        return None
+
+    def _local_state_key(self, raw_env) -> tuple:
+        game = getattr(raw_env, "_game", None)
+        if game is None:
+            return (id(raw_env),)
+
+        parts = [getattr(game, "_current_level_index", 0), getattr(game, "_state", None)]
+        for value in getattr(game, "__dict__", {}).values():
+            if hasattr(value, "pixels") and hasattr(value, "_x") and hasattr(value, "_y"):
+                tags = tuple(sorted(getattr(value, "tags", [])))
+                parts.append((getattr(value, "_x", 0), getattr(value, "_y", 0), tags))
+        return tuple(parts)
 
 
 # ---------------------------------------------------------------------------
