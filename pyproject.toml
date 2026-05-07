@@ -2,7 +2,7 @@
 name = "arc-autoresearch"
 version = "0.1.0"
 description = "Autonomous neuro-symbolic agent research for ARC-AGI-3"
-requires-python = ">=3.10"
+requires-python = ">=3.12,<3.14"
 
 dependencies = [
     # ── Core ──────────────────────────────────────────────────────────────────
@@ -11,7 +11,7 @@ dependencies = [
 
     # ── ARC-AGI-3 Environment ─────────────────────────────────────────────────
     "gymnasium>=0.29.0",         # standard gym interface for env_setup.py
-    "arcprize",                  # ARC-AGI-3 task loader (pip install arcprize)
+    "arc-agi",                   # ARC-AGI-3 toolkit (imports as arc_agi)
 
     # ── Perception (Step vi) ───────────────────────────────────────────────────
     "scikit-image>=0.22.0",      # connected-component labeling, region props
@@ -46,7 +46,8 @@ dependencies = [
 
 [project.optional-dependencies]
 gpu = [
-    "faiss-gpu>=1.8.0",          # GPU-accelerated memory retrieval
+    # faiss-gpu is not available on Windows through the default resolver.
+    # Use faiss-cpu here; Linux GPU runners can install faiss-gpu manually.
 ]
 dev = [
     "pytest>=8.0.0",
@@ -56,6 +57,13 @@ dev = [
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["modules"]
+include = [
+    "agent.py",
+    "prepare.py",
+]
 
 [tool.uv]
 dev-dependencies = [

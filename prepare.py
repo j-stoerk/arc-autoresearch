@@ -1,389 +1,393 @@
 """
-One-time data preparation for autoresearch experiments.
-Downloads data shards and trains a BPE tokenizer.
+ARC-AGI-3 setup and fixed evaluation harness for autoresearch experiments.
 
 Usage:
-    python prepare.py                  # full prep (download + tokenizer)
-    python prepare.py --num-shards 8   # download only 8 shards (for testing)
+    uv run prepare.py
 
-Data and tokenizer are stored in ~/.cache/autoresearch/.
+This creates/updates `.cache/arc3/` with the public environment manifest used by
+the experiment harness. The agent imports this module at runtime; do not change
+the scoring code during experiments.
 """
 
-import os
-import sys
-import time
-import math
+from __future__ import annotations
+
 import argparse
-import pickle
-from multiprocessing import Pool
+import json
+import math
+import os
+import random
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Iterator
 
-import requests
-import pyarrow.parquet as pq
-import rustbpe
-import tiktoken
-import torch
-
-# ---------------------------------------------------------------------------
-# Constants (fixed, do not modify)
-# ---------------------------------------------------------------------------
-
-MAX_SEQ_LEN = 2048       # context length
-TIME_BUDGET = 300        # training time budget in seconds (5 minutes)
-EVAL_TOKENS = 40 * 524288  # number of tokens for val eval
+import numpy as np
 
 # ---------------------------------------------------------------------------
-# Configuration
+# Constants (fixed, do not modify during experiments)
 # ---------------------------------------------------------------------------
 
-CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "autoresearch")
-DATA_DIR = os.path.join(CACHE_DIR, "data")
-TOKENIZER_DIR = os.path.join(CACHE_DIR, "tokenizer")
-BASE_URL = "https://huggingface.co/datasets/karpathy/climbmix-400b-shuffle/resolve/main"
-MAX_SHARD = 6542 # the last datashard is shard_06542.parquet
-VAL_SHARD = MAX_SHARD  # pinned validation shard (shard_06542)
-VAL_FILENAME = f"shard_{VAL_SHARD:05d}.parquet"
-VOCAB_SIZE = 8192
+TIME_BUDGET = 300
+NUM_PUBLIC_TASKS = 25
+RHAE_EXPONENT = 2.0
+DEFAULT_ACTION_BUDGET = 100
+GRID_SIZE = 64
 
-# BPE split pattern (GPT-4 style, with \p{N}{1,2} instead of {1,3})
-SPLIT_PATTERN = r"""'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}{1,2}| ?[^\s\p{L}\p{N}]++[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+"""
+ROOT = Path(__file__).resolve().parent
+CACHE_DIR = ROOT / ".cache" / "arc3"
+MANIFEST_PATH = CACHE_DIR / "manifest.json"
 
-SPECIAL_TOKENS = [f"<|reserved_{i}|>" for i in range(4)]
-BOS_TOKEN = "<|reserved_0|>"
-
-# ---------------------------------------------------------------------------
-# Data download
-# ---------------------------------------------------------------------------
-
-def download_single_shard(index):
-    """Download one parquet shard with retries. Returns True on success."""
-    filename = f"shard_{index:05d}.parquet"
-    filepath = os.path.join(DATA_DIR, filename)
-    if os.path.exists(filepath):
-        return True
-
-    url = f"{BASE_URL}/{filename}"
-    max_attempts = 5
-    for attempt in range(1, max_attempts + 1):
-        try:
-            response = requests.get(url, stream=True, timeout=30)
-            response.raise_for_status()
-            temp_path = filepath + ".tmp"
-            with open(temp_path, "wb") as f:
-                for chunk in response.iter_content(chunk_size=1024 * 1024):
-                    if chunk:
-                        f.write(chunk)
-            os.rename(temp_path, filepath)
-            print(f"  Downloaded {filename}")
-            return True
-        except (requests.RequestException, IOError) as e:
-            print(f"  Attempt {attempt}/{max_attempts} failed for {filename}: {e}")
-            for path in [filepath + ".tmp", filepath]:
-                if os.path.exists(path):
-                    try:
-                        os.remove(path)
-                    except OSError:
-                        pass
-            if attempt < max_attempts:
-                time.sleep(2 ** attempt)
-    return False
+# Public examples from the ARC-AGI-3 docs/changelog. `prepare.py` refreshes this
+# list from the toolkit/API when possible, but these make offline setup stable.
+FALLBACK_PUBLIC_GAMES = [
+    "ls20",
+    "ft09",
+    "vc33",
+    "tn36",
+    "m0r0",
+    "r11l",
+    "tu93",
+    "sc25",
+    "ar25",
+    "dc22",
+    "cn04",
+    "sp80",
+    "su15",
+    "re86",
+    "ka59",
+    "s5i5",
+    "sk48",
+]
 
 
-def download_data(num_shards, download_workers=8):
-    """Download training shards + pinned validation shard."""
-    os.makedirs(DATA_DIR, exist_ok=True)
-    num_train = min(num_shards, MAX_SHARD)
-    ids = list(range(num_train))
-    if VAL_SHARD not in ids:
-        ids.append(VAL_SHARD)
-
-    # Count what's already downloaded
-    existing = sum(1 for i in ids if os.path.exists(os.path.join(DATA_DIR, f"shard_{i:05d}.parquet")))
-    if existing == len(ids):
-        print(f"Data: all {len(ids)} shards already downloaded at {DATA_DIR}")
-        return
-
-    needed = len(ids) - existing
-    print(f"Data: downloading {needed} shards ({existing} already exist)...")
-
-    workers = max(1, min(download_workers, needed))
-    with Pool(processes=workers) as pool:
-        results = pool.map(download_single_shard, ids)
-
-    ok = sum(1 for r in results if r)
-    print(f"Data: {ok}/{len(ids)} shards ready at {DATA_DIR}")
-
-# ---------------------------------------------------------------------------
-# Tokenizer training
-# ---------------------------------------------------------------------------
-
-def list_parquet_files():
-    """Return sorted list of parquet file paths in the data directory."""
-    files = sorted(f for f in os.listdir(DATA_DIR) if f.endswith(".parquet") and not f.endswith(".tmp"))
-    return [os.path.join(DATA_DIR, f) for f in files]
+@dataclass
+class TaskSpec:
+    task_id: str
+    game_id: str
+    seed: int
+    level_index: int = 1
+    human_actions: int = 20
 
 
-def text_iterator(max_chars=1_000_000_000, doc_cap=10_000):
-    """Yield documents from training split (all shards except pinned val shard)."""
-    parquet_paths = [p for p in list_parquet_files() if not p.endswith(VAL_FILENAME)]
-    nchars = 0
-    for filepath in parquet_paths:
-        pf = pq.ParquetFile(filepath)
-        for rg_idx in range(pf.num_row_groups):
-            rg = pf.read_row_group(rg_idx)
-            for text in rg.column("text").to_pylist():
-                doc = text[:doc_cap] if len(text) > doc_cap else text
-                nchars += len(doc)
-                yield doc
-                if nchars >= max_chars:
-                    return
+@dataclass
+class EpisodeResult:
+    task_id: str
+    actions_taken: int
+    goal_reached: bool
+    rhae: float = 0.0
 
 
-def train_tokenizer():
-    """Train BPE tokenizer using rustbpe, save as tiktoken pickle."""
-    tokenizer_pkl = os.path.join(TOKENIZER_DIR, "tokenizer.pkl")
-    token_bytes_path = os.path.join(TOKENIZER_DIR, "token_bytes.pt")
-
-    if os.path.exists(tokenizer_pkl) and os.path.exists(token_bytes_path):
-        print(f"Tokenizer: already trained at {TOKENIZER_DIR}")
-        return
-
-    os.makedirs(TOKENIZER_DIR, exist_ok=True)
-
-    parquet_files = list_parquet_files()
-    if len(parquet_files) < 2:
-        print("Tokenizer: need at least 2 data shards (1 train + 1 val). Download more data first.")
-        sys.exit(1)
-
-    # --- Train with rustbpe ---
-    print("Tokenizer: training BPE tokenizer...")
-    t0 = time.time()
-
-    tokenizer = rustbpe.Tokenizer()
-    vocab_size_no_special = VOCAB_SIZE - len(SPECIAL_TOKENS)
-    tokenizer.train_from_iterator(text_iterator(), vocab_size_no_special, pattern=SPLIT_PATTERN)
-
-    # Build tiktoken encoding from trained merges
-    pattern = tokenizer.get_pattern()
-    mergeable_ranks = {bytes(k): v for k, v in tokenizer.get_mergeable_ranks()}
-    tokens_offset = len(mergeable_ranks)
-    special_tokens = {name: tokens_offset + i for i, name in enumerate(SPECIAL_TOKENS)}
-    enc = tiktoken.Encoding(
-        name="rustbpe",
-        pat_str=pattern,
-        mergeable_ranks=mergeable_ranks,
-        special_tokens=special_tokens,
-    )
-
-    # Save tokenizer
-    with open(tokenizer_pkl, "wb") as f:
-        pickle.dump(enc, f)
-
-    t1 = time.time()
-    print(f"Tokenizer: trained in {t1 - t0:.1f}s, saved to {tokenizer_pkl}")
-
-    # --- Build token_bytes lookup for BPB evaluation ---
-    print("Tokenizer: building token_bytes lookup...")
-    special_set = set(SPECIAL_TOKENS)
-    token_bytes_list = []
-    for token_id in range(enc.n_vocab):
-        token_str = enc.decode([token_id])
-        if token_str in special_set:
-            token_bytes_list.append(0)
-        else:
-            token_bytes_list.append(len(token_str.encode("utf-8")))
-    token_bytes_tensor = torch.tensor(token_bytes_list, dtype=torch.int32)
-    torch.save(token_bytes_tensor, token_bytes_path)
-    print(f"Tokenizer: saved token_bytes to {token_bytes_path}")
-
-    # Sanity check
-    test = "Hello world! Numbers: 123. Unicode: 你好"
-    encoded = enc.encode_ordinary(test)
-    decoded = enc.decode(encoded)
-    assert decoded == test, f"Tokenizer roundtrip failed: {test!r} -> {decoded!r}"
-    print(f"Tokenizer: sanity check passed (vocab_size={enc.n_vocab})")
-
-# ---------------------------------------------------------------------------
-# Runtime utilities (imported by train.py)
-# ---------------------------------------------------------------------------
-
-class Tokenizer:
-    """Minimal tokenizer wrapper. Training is handled above."""
-
-    def __init__(self, enc):
-        self.enc = enc
-        self.bos_token_id = enc.encode_single_token(BOS_TOKEN)
-
-    @classmethod
-    def from_directory(cls, tokenizer_dir=TOKENIZER_DIR):
-        with open(os.path.join(tokenizer_dir, "tokenizer.pkl"), "rb") as f:
-            enc = pickle.load(f)
-        return cls(enc)
-
-    def get_vocab_size(self):
-        return self.enc.n_vocab
-
-    def get_bos_token_id(self):
-        return self.bos_token_id
-
-    def encode(self, text, prepend=None, num_threads=8):
-        if prepend is not None:
-            prepend_id = prepend if isinstance(prepend, int) else self.enc.encode_single_token(prepend)
-        if isinstance(text, str):
-            ids = self.enc.encode_ordinary(text)
-            if prepend is not None:
-                ids.insert(0, prepend_id)
-        elif isinstance(text, list):
-            ids = self.enc.encode_ordinary_batch(text, num_threads=num_threads)
-            if prepend is not None:
-                for row in ids:
-                    row.insert(0, prepend_id)
-        else:
-            raise ValueError(f"Invalid input type: {type(text)}")
-        return ids
-
-    def decode(self, ids):
-        return self.enc.decode(ids)
+class ActionBudgetExceeded(RuntimeError):
+    pass
 
 
-def get_token_bytes(device="cpu"):
-    path = os.path.join(TOKENIZER_DIR, "token_bytes.pt")
-    with open(path, "rb") as f:
-        return torch.load(f, map_location=device)
+class ARCEnvAdapter:
+    """Small compatibility layer for the current agent's gym-like executor."""
+
+    def __init__(self, raw_env: Any, spec: TaskSpec):
+        self.raw_env = raw_env
+        self.spec = spec
+        self.actions_taken = 0
+        self.action_budget = max(1, 5 * spec.human_actions)
+        self.last_obs = None
+        self.spec_adapter = type(
+            "SpecAdapter",
+            (),
+            {"env_spec": {}, "task_id": spec.task_id, "game_id": spec.game_id},
+        )()
+
+    @property
+    def spec(self):
+        return self._spec_adapter
+
+    @spec.setter
+    def spec(self, value: TaskSpec) -> None:
+        self.task_spec = value
+        self._spec_adapter = type(
+            "SpecAdapter",
+            (),
+            {"env_spec": {}, "task_id": value.task_id, "game_id": value.game_id},
+        )()
+
+    def reset(self) -> np.ndarray:
+        obs = self.raw_env.reset()
+        self.actions_taken = 0
+        self.last_obs = obs
+        return env_to_grid(self.raw_env, obs)
+
+    def step(self, action_id: int):
+        if self.actions_taken >= self.action_budget:
+            raise ActionBudgetExceeded(self.task_spec.task_id)
+
+        action, data = self._map_action(action_id)
+        obs = self.raw_env.step(action, data=data)
+        self.actions_taken += 1
+        self.last_obs = obs
+
+        grid = env_to_grid(self.raw_env, obs)
+        state_name = _state_name(obs)
+        done = state_name in {"WIN", "GAME_OVER", "LOSE", "LOSS"}
+        reward = 1.0 if state_name == "WIN" else 0.0
+        info = {
+            "state": state_name,
+            "levels_completed": getattr(obs, "levels_completed", None),
+            "score": getattr(obs, "score", None),
+        }
+        return grid, reward, done, info
+
+    def _map_action(self, action_id: int):
+        actions = list(getattr(self.raw_env, "action_space", []) or [])
+        if not actions:
+            raise RuntimeError(f"No actions available for {self.task_spec.game_id}")
+
+        action = _action_by_id(actions, action_id)
+        data = {}
+        is_complex = getattr(action, "is_complex", None)
+        if callable(is_complex) and is_complex():
+            # The current DSL emits only discrete ids. Use a deterministic probe
+            # point so complex actions remain legal and reproducible.
+            data = {"x": (action_id * 17) % GRID_SIZE, "y": (action_id * 31) % GRID_SIZE}
+        return action, data
 
 
-def _document_batches(split, tokenizer_batch_size=128):
-    """Infinite iterator over document batches from parquet files."""
-    parquet_paths = list_parquet_files()
-    assert len(parquet_paths) > 0, "No parquet files found. Run prepare.py first."
-    val_path = os.path.join(DATA_DIR, VAL_FILENAME)
-    if split == "train":
-        parquet_paths = [p for p in parquet_paths if p != val_path]
-        assert len(parquet_paths) > 0, "No training shards found."
+def _action_by_id(actions: list[Any], action_id: int):
+    wanted_names = (f"ACTION{action_id}", f"ACTION{action_id + 1}")
+    for wanted in wanted_names:
+        for action in actions:
+            if getattr(action, "name", "") == wanted:
+                return action
+    return actions[action_id % len(actions)]
+
+
+def _state_name(obs: Any) -> str:
+    state = getattr(obs, "state", None)
+    return getattr(state, "name", str(state or "")).upper()
+
+
+def frame_to_grid(frame: Any) -> np.ndarray:
+    """Extract a 2D integer grid from toolkit frame objects or raw JSON."""
+    if frame is None:
+        return np.zeros((GRID_SIZE, GRID_SIZE), dtype=np.int32)
+
+    if isinstance(frame, np.ndarray):
+        arr = frame
+    elif isinstance(frame, list):
+        arr = np.asarray(frame)
+    elif isinstance(frame, dict):
+        arr = _grid_from_mapping(frame)
     else:
-        parquet_paths = [val_path]
-    epoch = 1
-    while True:
-        for filepath in parquet_paths:
-            pf = pq.ParquetFile(filepath)
-            for rg_idx in range(pf.num_row_groups):
-                rg = pf.read_row_group(rg_idx)
-                batch = rg.column('text').to_pylist()
-                for i in range(0, len(batch), tokenizer_batch_size):
-                    yield batch[i:i+tokenizer_batch_size], epoch
-        epoch += 1
+        for name in ("grid", "frame", "screen", "board", "cells", "data"):
+            if hasattr(frame, name):
+                return frame_to_grid(getattr(frame, name))
+        if hasattr(frame, "model_dump"):
+            return frame_to_grid(frame.model_dump())
+        if hasattr(frame, "__dict__"):
+            return frame_to_grid(vars(frame))
+        raise ValueError(f"Cannot extract grid from frame type {type(frame)!r}")
+
+    arr = np.asarray(arr, dtype=np.int32)
+    if arr.ndim == 3:
+        arr = arr[:, :, 0]
+    if arr.ndim != 2:
+        raise ValueError(f"Expected 2D grid, got shape {arr.shape}")
+    return arr
 
 
-def make_dataloader(tokenizer, B, T, split, buffer_size=1000):
-    """
-    BOS-aligned dataloader with best-fit packing.
-    Every row starts with BOS. Documents packed using best-fit to minimize cropping.
-    When no document fits remaining space, crops shortest doc to fill exactly.
-    100% utilization (no padding).
-    """
-    assert split in ["train", "val"]
-    row_capacity = T + 1
-    batches = _document_batches(split)
-    bos_token = tokenizer.get_bos_token_id()
-    doc_buffer = []
-    epoch = 1
+def _grid_from_mapping(data: dict[str, Any]) -> np.ndarray:
+    for key in ("grid", "frame", "screen", "board", "cells", "data"):
+        value = data.get(key)
+        if isinstance(value, (list, tuple, np.ndarray, dict)):
+            try:
+                return frame_to_grid(value)
+            except Exception:
+                pass
+    for value in data.values():
+        if isinstance(value, (list, tuple, np.ndarray, dict)):
+            try:
+                return frame_to_grid(value)
+            except Exception:
+                pass
+    raise ValueError("No grid-like field found in frame mapping")
 
-    def refill_buffer():
-        nonlocal epoch
-        doc_batch, epoch = next(batches)
-        token_lists = tokenizer.encode(doc_batch, prepend=bos_token)
-        doc_buffer.extend(token_lists)
 
-    # Pre-allocate buffers: [inputs (B*T) | targets (B*T)]
-    row_buffer = torch.empty((B, row_capacity), dtype=torch.long)
-    cpu_buffer = torch.empty(2 * B * T, dtype=torch.long, pin_memory=True)
-    gpu_buffer = torch.empty(2 * B * T, dtype=torch.long, device="cuda")
-    cpu_inputs = cpu_buffer[:B * T].view(B, T)
-    cpu_targets = cpu_buffer[B * T:].view(B, T)
-    inputs = gpu_buffer[:B * T].view(B, T)
-    targets = gpu_buffer[B * T:].view(B, T)
+def env_to_grid(raw_env: Any, frame: Any = None) -> np.ndarray:
+    """Render the local ARC game sprite state into a compact integer grid."""
+    game = getattr(raw_env, "_game", None)
+    if game is not None:
+        try:
+            return _grid_from_game(game)
+        except Exception:
+            pass
+    return frame_to_grid(frame)
 
-    while True:
-        for row_idx in range(B):
-            pos = 0
-            while pos < row_capacity:
-                while len(doc_buffer) < buffer_size:
-                    refill_buffer()
 
-                remaining = row_capacity - pos
+def _grid_from_game(game: Any) -> np.ndarray:
+    sprites = []
+    for value in getattr(game, "__dict__", {}).values():
+        if hasattr(value, "pixels") and hasattr(value, "_x") and hasattr(value, "_y"):
+            sprites.append(value)
 
-                # Find largest doc that fits entirely
-                best_idx = -1
-                best_len = 0
-                for i, doc in enumerate(doc_buffer):
-                    doc_len = len(doc)
-                    if doc_len <= remaining and doc_len > best_len:
-                        best_idx = i
-                        best_len = doc_len
+    if not sprites:
+        raise ValueError("No sprites found on ARC game instance")
 
-                if best_idx >= 0:
-                    doc = doc_buffer.pop(best_idx)
-                    row_buffer[row_idx, pos:pos + len(doc)] = torch.tensor(doc, dtype=torch.long)
-                    pos += len(doc)
-                else:
-                    # No doc fits — crop shortest to fill remaining
-                    shortest_idx = min(range(len(doc_buffer)), key=lambda i: len(doc_buffer[i]))
-                    doc = doc_buffer.pop(shortest_idx)
-                    row_buffer[row_idx, pos:pos + remaining] = torch.tensor(doc[:remaining], dtype=torch.long)
-                    pos += remaining
+    grid = np.zeros((GRID_SIZE, GRID_SIZE), dtype=np.int32)
+    sprites = sorted(sprites, key=lambda s: int(getattr(s, "_layer", 0)))
+    for sprite in sprites:
+        pixels = np.asarray(sprite.pixels, dtype=np.int32)
+        if pixels.ndim != 2:
+            continue
+        y = int(getattr(sprite, "_y", 0))
+        x = int(getattr(sprite, "_x", 0))
+        h, w = pixels.shape
+        r0, c0 = max(0, y), max(0, x)
+        r1, c1 = min(GRID_SIZE, y + h), min(GRID_SIZE, x + w)
+        if r0 >= r1 or c0 >= c1:
+            continue
+        sr0, sc0 = r0 - y, c0 - x
+        patch = pixels[sr0 : sr0 + (r1 - r0), sc0 : sc0 + (c1 - c0)]
+        mask = patch >= 0
+        grid[r0:r1, c0:c1][mask] = patch[mask]
+    return grid
 
-        cpu_inputs.copy_(row_buffer[:, :-1])
-        cpu_targets.copy_(row_buffer[:, 1:])
-        gpu_buffer.copy_(cpu_buffer, non_blocking=True)
-        yield inputs, targets, epoch
 
-# ---------------------------------------------------------------------------
-# Evaluation (DO NOT CHANGE — this is the fixed metric)
-# ---------------------------------------------------------------------------
+def _import_arcade():
+    try:
+        import arc_agi
+        from arc_agi import OperationMode
+    except ImportError as exc:
+        raise RuntimeError(
+            "ARC-AGI-3 toolkit is not installed. Run `uv sync` after the project "
+            "dependency is set to `arc-agi`, then run `uv run prepare.py`."
+        ) from exc
+    return arc_agi, OperationMode
 
-@torch.no_grad()
-def evaluate_bpb(model, tokenizer, batch_size):
-    """
-    Bits per byte (BPB): vocab size-independent evaluation metric.
-    Sums per-token cross-entropy (in nats), sums target byte lengths,
-    then converts nats/byte to bits/byte. Special tokens (byte length 0)
-    are excluded from both sums.
-    Uses fixed MAX_SEQ_LEN so results are comparable across configs.
-    """
-    token_bytes = get_token_bytes(device="cuda")
-    val_loader = make_dataloader(tokenizer, batch_size, MAX_SEQ_LEN, "val")
-    steps = EVAL_TOKENS // (batch_size * MAX_SEQ_LEN)
-    total_nats = 0.0
-    total_bytes = 0
-    for _ in range(steps):
-        x, y, _ = next(val_loader)
-        loss_flat = model(x, y, reduction='none').view(-1)
-        y_flat = y.view(-1)
-        nbytes = token_bytes[y_flat]
-        mask = nbytes > 0
-        total_nats += (loss_flat * mask).sum().item()
-        total_bytes += nbytes.sum().item()
-    return total_nats / (math.log(2) * total_bytes)
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
+def _make_arcade(operation_mode: str = "OFFLINE"):
+    arc_agi, OperationMode = _import_arcade()
+    mode = getattr(OperationMode, operation_mode)
+    return arc_agi.Arcade(operation_mode=mode, environments_dir=str(CACHE_DIR))
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Prepare data and tokenizer for autoresearch")
-    parser.add_argument("--num-shards", type=int, default=10, help="Number of training shards to download (-1 = all). Val shard is always pinned.")
-    parser.add_argument("--download-workers", type=int, default=8, help="Number of parallel download workers")
+
+def _env_id(env_info: Any) -> str:
+    if isinstance(env_info, str):
+        return env_info
+    if isinstance(env_info, dict):
+        return str(env_info.get("game_id") or env_info.get("id") or env_info.get("name"))
+    return str(getattr(env_info, "game_id", None) or getattr(env_info, "id", None) or env_info)
+
+
+def discover_public_games(allow_online: bool = True) -> list[str]:
+    modes = ["NORMAL", "OFFLINE"] if allow_online else ["OFFLINE"]
+    for mode in modes:
+        try:
+            arc = _make_arcade(mode)
+            envs = [_env_id(env) for env in arc.get_environments()]
+            envs = [env for env in envs if env and env != "None"]
+            if envs:
+                return sorted(dict.fromkeys(envs))[:NUM_PUBLIC_TASKS]
+        except Exception as exc:
+            print(f"Discovery via ARC toolkit {mode} failed: {exc}")
+
+    if len(FALLBACK_PUBLIC_GAMES) >= NUM_PUBLIC_TASKS:
+        return FALLBACK_PUBLIC_GAMES[:NUM_PUBLIC_TASKS]
+    return FALLBACK_PUBLIC_GAMES[:]
+
+
+def write_manifest(game_ids: list[str]) -> None:
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    tasks = [
+        {
+            "task_id": f"{game_id}:{seed}",
+            "game_id": game_id,
+            "seed": seed,
+            "level_index": i + 1,
+            "human_actions": 20,
+        }
+        for i, (game_id, seed) in enumerate((gid, 0) for gid in game_ids[:NUM_PUBLIC_TASKS])
+    ]
+    MANIFEST_PATH.write_text(json.dumps({"tasks": tasks}, indent=2) + "\n", encoding="utf-8")
+    for task in tasks:
+        task_path = CACHE_DIR / f"{task['game_id']}.json"
+        task_path.write_text(json.dumps(task, indent=2) + "\n", encoding="utf-8")
+
+
+def load_task_specs() -> list[TaskSpec]:
+    if not MANIFEST_PATH.exists():
+        raise FileNotFoundError("Missing .cache/arc3/manifest.json. Run `uv run prepare.py`.")
+    payload = json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
+    return [TaskSpec(**row) for row in payload.get("tasks", [])][:NUM_PUBLIC_TASKS]
+
+
+def episode_iterator() -> Iterator[tuple[TaskSpec, ARCEnvAdapter, np.ndarray]]:
+    specs = load_task_specs()
+    if len(specs) < NUM_PUBLIC_TASKS:
+        raise RuntimeError(f"Expected {NUM_PUBLIC_TASKS} tasks, found {len(specs)}")
+
+    try:
+        arc = _make_arcade("OFFLINE")
+    except Exception:
+        arc = _make_arcade("NORMAL")
+    for spec in specs:
+        raw_env = arc.make(spec.game_id, seed=spec.seed)
+        if raw_env is None:
+            arc = _make_arcade("NORMAL")
+            raw_env = arc.make(spec.game_id, seed=spec.seed)
+        if raw_env is None:
+            raise RuntimeError(f"Failed to create ARC environment {spec.game_id}")
+        env = ARCEnvAdapter(raw_env, spec)
+        yield spec, env, env.reset()
+
+
+def evaluate_rhae(agent) -> dict[str, float]:
+    """Fixed RHAE evaluation over the prepared public ARC-AGI-3 environments."""
+    started = time.monotonic()
+    results: list[EpisodeResult] = []
+
+    for spec, env, initial_obs in episode_iterator():
+        if time.monotonic() - started > TIME_BUDGET:
+            break
+        result = agent.run_episode(spec, env, initial_obs)
+        result.rhae = _episode_rhae(spec, result)
+        results.append(result)
+
+    weight_total = sum(max(1, spec.level_index) for spec in load_task_specs()[: len(results)])
+    weighted_score = 0.0
+    for spec, result in zip(load_task_specs(), results):
+        weighted_score += max(1, spec.level_index) * result.rhae
+
+    avg_actions = sum(r.actions_taken for r in results) / max(1, len(results))
+    return {
+        "rhae_score": weighted_score / max(1, weight_total),
+        "avg_actions": avg_actions,
+        "goal_reached_pct": sum(r.goal_reached for r in results) / max(1, len(results)),
+        "episodes_run": len(results),
+    }
+
+
+def _episode_rhae(spec: TaskSpec, result: EpisodeResult) -> float:
+    if not result.goal_reached:
+        return 0.0
+    if result.actions_taken > 5 * spec.human_actions:
+        return 0.0
+    ratio = spec.human_actions / max(1, result.actions_taken)
+    return min(1.0, math.pow(ratio, RHAE_EXPONENT))
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Prepare ARC-AGI-3 public environments")
+    parser.add_argument("--offline", action="store_true", help="Do not query the ARC service")
     args = parser.parse_args()
 
-    num_shards = MAX_SHARD if args.num_shards == -1 else args.num_shards
+    print(f"ARC cache directory: {CACHE_DIR}")
+    game_ids = discover_public_games(allow_online=not args.offline)
+    write_manifest(game_ids)
 
-    print(f"Cache directory: {CACHE_DIR}")
-    print()
+    count = len(load_task_specs())
+    print(f"Prepared {count}/{NUM_PUBLIC_TASKS} public ARC task specs.")
+    if count < NUM_PUBLIC_TASKS:
+        raise SystemExit("Not enough public environments discovered. Set ARC_API_KEY and rerun.")
+    print("Done! Ready to run `uv run agent.py`.")
 
-    # Step 1: Download data
-    download_data(num_shards, download_workers=args.download_workers)
-    print()
 
-    # Step 2: Train tokenizer
-    train_tokenizer()
-    print()
-    print("Done! Ready to train.")
+if __name__ == "__main__":
+    main()

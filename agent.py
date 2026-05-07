@@ -26,7 +26,7 @@ Usage:
 import time
 import numpy as np
 
-from env_setup import (
+from prepare import (
     evaluate_rhae,
     episode_iterator,
     EpisodeResult,
