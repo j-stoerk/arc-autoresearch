@@ -156,11 +156,14 @@ class ARCEnvAdapter:
 
 
 def _action_by_id(actions: list[Any], action_id: int):
-    wanted_names = (f"ACTION{action_id}", f"ACTION{action_id + 1}")
-    for wanted in wanted_names:
-        for action in actions:
-            if getattr(action, "name", "") == wanted:
-                return action
+    wanted = f"ACTION{action_id + 1}"
+    for action in actions:
+        if getattr(action, "name", "") == wanted:
+            return action
+    direct = f"ACTION{action_id}"
+    for action in actions:
+        if action_id > 0 and getattr(action, "name", "") == direct:
+            return action
     return actions[action_id % len(actions)]
 
 

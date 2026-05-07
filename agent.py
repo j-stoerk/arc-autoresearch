@@ -50,7 +50,7 @@ from modules.loop          import LoopController
 # Hyperparameters (agent modifies these)
 # ---------------------------------------------------------------------------
 
-BEAM_WIDTH       = 5       # search beam width
+BEAM_WIDTH       = 7       # search beam width
 MAX_DEPTH        = 4       # max program length per plan
 MAX_REPLANS      = 8       # max replanning cycles per episode
 STALL_THRESHOLD  = 4       # steps without grid change before replan
@@ -79,6 +79,15 @@ class Agent:
     def __init__(self):
         self.dsl        = DSLConfig(beam_width=BEAM_WIDTH, max_depth=MAX_DEPTH,
                                     min_relevance=MIN_RELEVANCE)
+        self.dsl.operations = [
+            Operation("arc_action_1", 0, preconditions=[], relevance=1.0),
+            Operation("arc_action_2", 1, preconditions=[], relevance=1.0),
+            Operation("arc_action_3", 2, preconditions=[], relevance=1.0),
+            Operation("arc_action_4", 3, preconditions=[], relevance=1.0),
+            Operation("arc_action_5", 4, preconditions=[], relevance=1.0),
+            Operation("arc_action_6", 5, preconditions=[], relevance=1.0),
+            Operation("arc_action_7", 6, preconditions=[], relevance=1.0),
+        ]
         self.library    = Library(min_freq=2)
         self.search     = Search(dsl=self.dsl, library=self.library)
         self.verifier   = Verifier(dsl=self.dsl)
@@ -154,7 +163,7 @@ class Agent:
                 program_done = True
                 continue
 
-            best_program = ranked[0]
+            best_program = ranked[self.loop.state.replans % len(ranked)]
 
             # ── Step v: execute program ───────────────────────────────── #
             records = self.executor.execute_program(best_program, env)

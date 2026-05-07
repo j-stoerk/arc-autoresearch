@@ -66,6 +66,8 @@ class Search:
             beams.append(Beam(ops=macro.ops[:], score=macro_score))
         beams = sorted(beams, key=lambda b: b.score, reverse=True)[:beam_width]
 
+        all_beams = beams[:]
+
         # Expand depth-first up to max_depth
         for _ in range(depth - 1):
             candidates: list[Beam] = []
@@ -76,5 +78,7 @@ class Search:
                         Beam(ops=beam.ops + [op.action_id], score=beam.score + s)
                     )
             beams = sorted(candidates, key=lambda b: b.score, reverse=True)[:beam_width]
+            all_beams.extend(beams)
 
-        return [b.ops for b in beams]
+        all_beams = sorted(all_beams, key=lambda b: (len(b.ops), -b.score))
+        return [b.ops for b in all_beams[:beam_width]]
