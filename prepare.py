@@ -113,7 +113,7 @@ class ARCEnvAdapter:
         obs = self.raw_env.reset()
         self.actions_taken = 0
         self.last_obs = obs
-        return env_to_grid(self.raw_env, obs)
+        return normalize_grid(env_to_grid(self.raw_env, obs))
 
     def step(self, action_id: int):
         if self.actions_taken >= self.action_budget:
@@ -124,7 +124,7 @@ class ARCEnvAdapter:
         self.actions_taken += 1
         self.last_obs = obs
 
-        grid = env_to_grid(self.raw_env, obs)
+        grid = normalize_grid(env_to_grid(self.raw_env, obs))
         state_name = _state_name(obs)
         done = state_name in {"WIN", "GAME_OVER", "LOSE", "LOSS"}
         reward = 1.0 if state_name == "WIN" else 0.0
@@ -190,7 +190,7 @@ def frame_to_grid(frame: Any) -> np.ndarray:
         arr = arr[:, :, 0]
     if arr.ndim != 2:
         raise ValueError(f"Expected 2D grid, got shape {arr.shape}")
-    return arr
+    return normalize_grid(arr)
 
 
 def _grid_from_mapping(data: dict[str, Any]) -> np.ndarray:
@@ -248,6 +248,21 @@ def _grid_from_game(game: Any) -> np.ndarray:
         mask = patch >= 0
         grid[r0:r1, c0:c1][mask] = patch[mask]
     return grid
+
+
+def normalize_grid(grid: Any) -> np.ndarray:
+    """Return a fixed 64x64 integer observation, padding/cropping as needed."""
+    arr = np.asarray(grid, dtype=np.int32)
+    if arr.ndim == 3:
+        arr = arr[:, :, 0]
+    if arr.ndim != 2:
+        return np.zeros((GRID_SIZE, GRID_SIZE), dtype=np.int32)
+
+    out = np.zeros((GRID_SIZE, GRID_SIZE), dtype=np.int32)
+    rows = min(GRID_SIZE, arr.shape[0])
+    cols = min(GRID_SIZE, arr.shape[1])
+    out[:rows, :cols] = arr[:rows, :cols]
+    return out
 
 
 def _import_arcade():
