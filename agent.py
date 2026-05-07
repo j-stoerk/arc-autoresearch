@@ -162,6 +162,9 @@ class Agent:
 
             if not records:
                 break
+            if any(rec.reward > 0.0 for rec in records):
+                goal_reached = True
+                break
 
             # ── Step vi: parse new state ──────────────────────────────── #
             last_obs  = records[-1].obs

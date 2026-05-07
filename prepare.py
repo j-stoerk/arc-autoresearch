@@ -67,6 +67,7 @@ class TaskSpec:
     seed: int
     level_index: int = 1
     human_actions: int = 20
+    baseline_actions: list[int] | None = None
 
 
 @dataclass
@@ -90,6 +91,7 @@ class ARCEnvAdapter:
         self.actions_taken = 0
         self.action_budget = max(1, 5 * spec.human_actions)
         self.last_obs = None
+        self.start_levels_completed = 0
         self.spec_adapter = type(
             "SpecAdapter",
             (),
@@ -113,6 +115,7 @@ class ARCEnvAdapter:
         obs = self.raw_env.reset()
         self.actions_taken = 0
         self.last_obs = obs
+        self.start_levels_completed = int(getattr(obs, "levels_completed", 0) or 0)
         return normalize_grid(env_to_grid(self.raw_env, obs))
 
     def step(self, action_id: int):
@@ -126,11 +129,13 @@ class ARCEnvAdapter:
 
         grid = normalize_grid(env_to_grid(self.raw_env, obs))
         state_name = _state_name(obs)
-        done = state_name in {"WIN", "GAME_OVER", "LOSE", "LOSS"}
-        reward = 1.0 if state_name == "WIN" else 0.0
+        levels_completed = int(getattr(obs, "levels_completed", 0) or 0)
+        level_done = levels_completed > self.start_levels_completed
+        done = level_done or state_name in {"WIN", "GAME_OVER", "LOSE", "LOSS"}
+        reward = 1.0 if level_done or state_name == "WIN" else 0.0
         info = {
             "state": state_name,
-            "levels_completed": getattr(obs, "levels_completed", None),
+            "levels_completed": levels_completed,
             "score": getattr(obs, "score", None),
         }
         return grid, reward, done, info
@@ -310,16 +315,20 @@ def discover_public_games(allow_online: bool = True) -> list[str]:
 
 def write_manifest(game_ids: list[str]) -> None:
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    tasks = [
-        {
-            "task_id": f"{game_id}:{seed}",
-            "game_id": game_id,
-            "seed": seed,
-            "level_index": i + 1,
-            "human_actions": 20,
-        }
-        for i, (game_id, seed) in enumerate((gid, 0) for gid in game_ids[:NUM_PUBLIC_TASKS])
-    ]
+    tasks = []
+    for i, game_id in enumerate(game_ids[:NUM_PUBLIC_TASKS]):
+        baseline_actions = _metadata_baseline_actions(game_id)
+        human_actions = baseline_actions[0] if baseline_actions else DEFAULT_ACTION_BUDGET
+        tasks.append(
+            {
+                "task_id": f"{game_id}:0",
+                "game_id": game_id,
+                "seed": 0,
+                "level_index": i + 1,
+                "human_actions": human_actions,
+                "baseline_actions": baseline_actions,
+            }
+        )
     MANIFEST_PATH.write_text(json.dumps({"tasks": tasks}, indent=2) + "\n", encoding="utf-8")
     for task in tasks:
         task_path = CACHE_DIR / f"{task['game_id']}.json"
@@ -331,6 +340,18 @@ def load_task_specs() -> list[TaskSpec]:
         raise FileNotFoundError("Missing .cache/arc3/manifest.json. Run `uv run prepare.py`.")
     payload = json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
     return [TaskSpec(**row) for row in payload.get("tasks", [])][:NUM_PUBLIC_TASKS]
+
+
+def _metadata_baseline_actions(game_id: str) -> list[int]:
+    game_name, _, version = game_id.partition("-")
+    metadata_path = CACHE_DIR / game_name / version / "metadata.json"
+    if not metadata_path.exists():
+        return []
+    try:
+        payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+        return [int(v) for v in payload.get("baseline_actions", []) if int(v) > 0]
+    except Exception:
+        return []
 
 
 def episode_iterator() -> Iterator[tuple[TaskSpec, ARCEnvAdapter, np.ndarray]]:
@@ -362,6 +383,9 @@ def evaluate_rhae(agent) -> dict[str, float]:
         if time.monotonic() - started > TIME_BUDGET:
             break
         result = agent.run_episode(spec, env, initial_obs)
+        if not result.goal_reached:
+            levels_completed = int(getattr(env.last_obs, "levels_completed", 0) or 0)
+            result.goal_reached = levels_completed > env.start_levels_completed
         result.rhae = _episode_rhae(spec, result)
         results.append(result)
 
