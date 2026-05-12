@@ -333,12 +333,17 @@ class Agent:
         return None
 
     def _update_dsl_from_bfs(self, raw_env, actions) -> None:
-        """Feed action-effectiveness observations into DSL relevance (WorldModel step viii).
+        """Feed action-effectiveness into DSL preconditions (WorldModel step viii).
 
-        Actions that change game state from the initial position get relevance=1.0;
-        those that don't get relevance=0.1. This biases beam-search towards productive
-        actions for games the BFS couldn't solve.
+        Actions that change game state keep preconditions=[] (always included by
+        conditioned_ops). Actions that do nothing get preconditions=["blocked"]
+        which is never in active_tags, so they are excluded from beam-search.
+        This survives the update_from_world_model call which only resets relevance,
+        not preconditions.
         """
+        # Reset all ops to unconstrained first
+        for op in self.dsl.operations:
+            op.preconditions = []
         init_key = self._local_state_key(raw_env)
         for action in actions:
             name = getattr(action, "name", "")
@@ -351,10 +356,10 @@ class Agent:
                 nxt = copy.deepcopy(raw_env)
                 nxt.step(action)
                 new_key = self._local_state_key(nxt)
-                effective = new_key != init_key
-                for op in self.dsl.operations:
-                    if op.action_id == action_id:
-                        op.relevance = 1.0 if effective else 0.1
+                if new_key == init_key:
+                    for op in self.dsl.operations:
+                        if op.action_id == action_id:
+                            op.preconditions = ["blocked"]  # excluded from conditioned_ops
             except Exception:
                 pass
 
