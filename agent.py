@@ -289,6 +289,7 @@ class Agent:
     def _find_level_plan(self, raw_env, actions, start_levels: int) -> list[str] | None:
         max_depth = 40
         max_nodes = 1800
+
         queue = deque([(copy.deepcopy(raw_env), [])])
         seen = set()
         nodes = 0
@@ -310,11 +311,12 @@ class Agent:
                 except Exception:
                     continue
                 new_plan = plan + [getattr(action, "name", str(action))]
-                levels_completed = int(getattr(obs, "levels_completed", 0) or 0)
-                if levels_completed > start_levels:
+                if int(getattr(obs, "levels_completed", 0) or 0) > start_levels:
                     return new_plan
                 if _state_name(obs) == "NOT_FINISHED":
-                    queue.append((nxt, new_plan))
+                    new_key = self._local_state_key(nxt)
+                    if new_key not in seen:
+                        queue.append((nxt, new_plan))
         return None
 
     def _local_state_key(self, raw_env) -> tuple:
