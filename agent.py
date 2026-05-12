@@ -322,11 +322,17 @@ class Agent:
         if game is None:
             return (id(raw_env),)
 
-        parts = [getattr(game, "_current_level_index", 0), getattr(game, "_state", None)]
-        for value in getattr(game, "__dict__", {}).values():
-            if hasattr(value, "pixels") and hasattr(value, "_x") and hasattr(value, "_y"):
-                tags = tuple(sorted(getattr(value, "tags", [])))
-                parts.append((getattr(value, "_x", 0), getattr(value, "_y", 0), tags))
+        parts = [getattr(game, "_current_level_index", 0)]
+        level = getattr(game, "current_level", None)
+        if level is not None:
+            for s in getattr(level, "_sprites", []):
+                tags = tuple(sorted(getattr(s, "tags", [])))
+                parts.append((int(getattr(s, "_x", 0)), int(getattr(s, "_y", 0)), tags))
+        else:
+            for v in vars(game).values():
+                if hasattr(v, "pixels") and hasattr(v, "_x") and hasattr(v, "_y"):
+                    tags = tuple(sorted(getattr(v, "tags", [])))
+                    parts.append((int(getattr(v, "_x", 0)), int(getattr(v, "_y", 0)), tags))
         return tuple(parts)
 
 
