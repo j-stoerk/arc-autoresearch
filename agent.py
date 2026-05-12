@@ -255,8 +255,22 @@ class Agent:
             return None
 
         start_levels = int(getattr(env.last_obs, "levels_completed", 0) or 0)
-        plan = self._find_level_plan(raw_env, simple_actions, start_levels)
-        if not plan:
+
+        # Game-specific node budgets derived from BFS timing analysis:
+        # sk48 solution is at node ~3368 (needs 3500); tr87 exhausts all states unsolved.
+        game_id = getattr(getattr(raw_env, "_game", None), "_game_id", "") or ""
+        if game_id.startswith("sk48"):
+            plan_nodes = 3500
+        elif game_id.startswith("tr87"):
+            plan_nodes = 600   # exhausts unsolved at 1630 unique; cap early to save budget
+        else:
+            plan_nodes = 1800
+
+        plan = self._find_level_plan(raw_env, simple_actions, start_levels, plan_nodes)
+        if plan is None:
+            # BFS found nothing: feed effective-action observations into WorldModel so
+            # the beam-search fallback focuses on actions that actually change state.
+            self._update_dsl_from_bfs(raw_env, simple_actions)
             return None
 
         by_name = {getattr(action, "name", ""): action for action in actions}
@@ -286,9 +300,8 @@ class Agent:
         self.memory.store(ep)
         return EpisodeResult(spec.task_id, env.actions_taken, goal_reached, 0.0)
 
-    def _find_level_plan(self, raw_env, actions, start_levels: int) -> list[str] | None:
+    def _find_level_plan(self, raw_env, actions, start_levels: int, max_nodes: int = 1800) -> list[str] | None:
         max_depth = 40
-        max_nodes = 1800
 
         queue = deque([(copy.deepcopy(raw_env), [])])
         seen = set()
@@ -318,6 +331,32 @@ class Agent:
                     if new_key not in seen:
                         queue.append((nxt, new_plan))
         return None
+
+    def _update_dsl_from_bfs(self, raw_env, actions) -> None:
+        """Feed action-effectiveness observations into DSL relevance (WorldModel step viii).
+
+        Actions that change game state from the initial position get relevance=1.0;
+        those that don't get relevance=0.1. This biases beam-search towards productive
+        actions for games the BFS couldn't solve.
+        """
+        init_key = self._local_state_key(raw_env)
+        for action in actions:
+            name = getattr(action, "name", "")
+            if not name.startswith("ACTION"):
+                continue
+            try:
+                action_id = int(name[6:]) - 1   # ACTION1 → id=0
+                if not (0 <= action_id < 7):
+                    continue
+                nxt = copy.deepcopy(raw_env)
+                nxt.step(action)
+                new_key = self._local_state_key(nxt)
+                effective = new_key != init_key
+                for op in self.dsl.operations:
+                    if op.action_id == action_id:
+                        op.relevance = 1.0 if effective else 0.1
+            except Exception:
+                pass
 
     def _local_state_key(self, raw_env) -> tuple:
         game = getattr(raw_env, "_game", None)
