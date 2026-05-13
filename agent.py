@@ -281,6 +281,9 @@ class Agent:
                             if int(getattr(obs, "levels_completed", 0) or 0) > start_levels:
                                 goal_reached = True
                                 break
+                            if _state_name(obs) == "WIN":
+                                goal_reached = True
+                                break
                     ep = Episode(
                         task_id=spec.task_id,
                         trajectory=[],
@@ -293,13 +296,13 @@ class Agent:
             return None
 
         # Phase 1: keyboard BFS
-        # Game-specific node budgets derived from BFS timing analysis:
-        # sk48 solution is at node ~3368 (needs 3500); tr87 exhausts all states unsolved.
+        # Game-specific node budgets: sk48 solution is at ~3368 nodes; tr87/g50t/wa30
+        # are unsolvable by keyboard BFS alone, capped early to stay within 300s budget.
         game_id = getattr(getattr(raw_env, "_game", None), "_game_id", "") or ""
         if game_id.startswith("sk48"):
             plan_nodes = 3500
-        elif game_id.startswith("tr87"):
-            plan_nodes = 600   # exhausts unsolved at 1630 unique; cap early to save budget
+        elif game_id.startswith(("tr87", "g50t", "wa30")):
+            plan_nodes = 200   # confirmed unsolvable; cap to save ~40s total budget
         else:
             plan_nodes = 1800
 
@@ -477,9 +480,12 @@ class Agent:
                 except Exception:
                     continue
                 new_path = path + [data]
+                obs_state = _state_name(obs)
                 if int(getattr(obs, "levels_completed", 0) or 0) > start_levels:
                     return new_path
-                if _state_name(obs) == "NOT_FINISHED":
+                if obs_state == "WIN":
+                    return new_path
+                if obs_state == "NOT_FINISHED":
                     k = self._click_state_key(nxt)
                     if k not in seen:
                         seen.add(k)
