@@ -109,6 +109,9 @@ class Agent:
         # Seed hypotheses
         self.hyp_set.seed(SEED_HYPOTHESES)
 
+        # Set on first episode call; used to enforce global TIME_BUDGET in BFS.
+        self._eval_start: float = 0.0
+
     # ------------------------------------------------------------------ #
     # Core episode loop                                                    #
     # ------------------------------------------------------------------ #
@@ -119,6 +122,8 @@ class Agent:
         Returns EpisodeResult with actions_taken and goal_reached.
         """
         t_start = time.monotonic()
+        if self._eval_start == 0.0:
+            self._eval_start = t_start
 
         # ── Step vi: parse initial state ─────────────────────────────── #
         self.perception.reset()
@@ -340,14 +345,15 @@ class Agent:
         self.memory.store(ep)
         return EpisodeResult(spec.task_id, env.actions_taken, goal_reached, 0.0)
 
-    def _find_level_plan(self, raw_env, actions, start_levels: int, max_nodes: int = 1800) -> list[str] | None:
+    def _find_level_plan(self, raw_env, actions, start_levels: int, max_nodes: int = 1800,
+                         global_deadline: float = float("inf")) -> list[str] | None:
         max_depth = 40
 
         queue = deque([(copy.deepcopy(raw_env), [])])
         seen = set()
         nodes = 0
 
-        while queue and nodes < max_nodes:
+        while queue and nodes < max_nodes and time.monotonic() < global_deadline:
             current, plan = queue.popleft()
             nodes += 1
             key = self._local_state_key(current)
@@ -431,7 +437,7 @@ class Agent:
 
     def _find_click_plan(
         self, raw_env, start_levels: int,
-        max_nodes: int = 500, time_limit: float = 3.0,
+        max_nodes: int = 500, time_limit: float = 5.0,
     ) -> list[dict] | None:
         scale = self._get_camera_scale(raw_env)
         game = getattr(raw_env, "_game", None)
@@ -447,8 +453,7 @@ class Agent:
         except ImportError:
             return None
 
-        # Only include sprites whose click changes pixel state (interactive sprites).
-        # This prunes background/decorative sprites and keeps BFS fast.
+        # Phase 1: sprite-center probing — fast filter for interactive positions.
         init_key = self._click_state_key(raw_env)
         candidates = []
         for s in getattr(level, "_sprites", []):
@@ -461,14 +466,44 @@ class Agent:
                     candidates.append(data)
             except Exception:
                 pass
+
+        # Phase 2: grid-probe fallback — when sprite centers miss the hotspots
+        # (e.g. games where click targets aren't at sprite boundaries).
+        # Triggers when < 3 sprite-center candidates found.
+        used_grid_probe = False
+        if len(candidates) < 3:
+            seen_xy = {(d["x"], d["y"]) for d in candidates}
+            t_probe = time.monotonic()
+            for dy in range(0, 64, 4):
+                if len(candidates) >= 30 or time.monotonic() - t_probe > 6.0:
+                    break
+                for dx in range(0, 64, 4):
+                    if len(candidates) >= 30:
+                        break
+                    if (dx, dy) in seen_xy:
+                        continue
+                    data = {"x": dx, "y": dy}
+                    try:
+                        probe = copy.deepcopy(raw_env)
+                        probe.step(click_action, data=data)
+                        if self._click_state_key(probe) != init_key:
+                            candidates.append(data)
+                            seen_xy.add((dx, dy))
+                    except Exception:
+                        pass
+            used_grid_probe = True
+
         if not candidates:
             return None
+
+        # Extend time limit when grid probe was used (deeper search needed for s5i5-like games).
+        effective_limit = 12.0 if used_grid_probe else time_limit
 
         from collections import deque
         queue = deque([(copy.deepcopy(raw_env), [])])
         seen = {self._click_state_key(raw_env)}
         nodes = 0
-        deadline = time.monotonic() + time_limit
+        deadline = time.monotonic() + effective_limit
 
         while queue and nodes < max_nodes and time.monotonic() < deadline:
             current, path = queue.popleft()
