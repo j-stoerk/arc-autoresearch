@@ -31,4 +31,5 @@ b615w7286	0.209486	10.6	discard	click-only BFS: 327s, 22 episodes, timing regres
 bel88vrhe	0.233846	10.8	discard	click BFS + 3s limit: same score, 283s vs 231s baseline -- more code, slower
 bb83hev97	0.233846	10.8	discard	keyboard+click followup: same score, 283s baseline -- more code, slower
 b4m5o0v3l	0.233846	2.8	discard	skip beam-search when BFS fails: same score but 303s (over budget margin)
-7f87a21	0.326154	10.4	keep	click BFS with camera display-coord scaling: vc33[24]+ft09[6] solved, 283.9s
+7f87a21	0.326154	10.4	discard	click BFS with camera display-coord scaling -- timing unstable (283-307s)
+82de7fa	0.326154	10.4	keep	cap g50t/wa30 at 200 nodes: same score, 227s total (-56s), stable timing
