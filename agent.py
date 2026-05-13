@@ -371,9 +371,12 @@ class Agent:
                 except Exception:
                     continue
                 new_plan = plan + [getattr(action, "name", str(action))]
+                obs_state = _state_name(obs)
                 if int(getattr(obs, "levels_completed", 0) or 0) > start_levels:
                     return new_plan
-                if _state_name(obs) == "NOT_FINISHED":
+                if obs_state == "WIN":
+                    return new_plan
+                if obs_state == "NOT_FINISHED":
                     new_key = self._local_state_key(nxt)
                     if new_key not in seen:
                         queue.append((nxt, new_plan))
