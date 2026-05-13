@@ -1,0 +1,34 @@
+commit	rhae_score	avg_actions	status	description
+152dbd6	0.000000	35.2	keep	baseline
+be34bb3	0.000000	35.2	discard	honor environment win signal
+444cad4	0.000000	34.9	discard	add encoded click probes
+cc92390	0.000000	16.0	discard	fallback object exploration
+5e10a57	0.000000	79.8	discard	spend full action budget
+a9e240f	0.061538	9.0	keep	add local level search fallback
+eaadf86	0.061538	9.0	discard	add click candidates to local search
+a9e240f	0.061538	10.9	discard	increase beam width 7→10
+a9e240f	0.061538	9.0	discard	increase max_depth 4→6
+a9e240f	0.061538	9.0	discard	lower min_relevance 0.1→0.05
+a9e240f	0.061538	12.7	discard	increase max_replans 8→12
+a9e240f	0.061538	9.0	discard	increase memory_size 64→128
+a9e240f	0.061538	9.0	discard	lower stall_threshold 4→2
+a9e240f	0.061538	9.0	discard	expand DSL from 7 to 13 operations
+a9e240f	0.061538	9.0	discard	expand DSL to all 15 actions (no preconditions)
+a9e240f	0.061538	9.0	discard	increase local_search_max_nodes 1800→3600
+a9e240f	0.061538	20.1	discard	increase max_replans 8→20
+8d17c97	0.058462	8.8	discard	include complex (positioned) actions in BFS -- regression
+903efa8	0.058462	8.8	discard	hybrid DFS/BFS -- state-change priority -- finds longer non-optimal paths
+bkovxssf	0.061538	9.0	discard	Phase-2 click BFS with sys_click sprites -- no improvement (internal state not in sprite positions)
+dde2f6b	0.141538	9.2	keep	fix state key: use current_level._sprites -- cd82+tu93 now solvable
+(pixel hash experiments discarded -- slower BFS, ar25 timeout at 10s limit)
+bg6rxgqw8	0.178462	9.5	keep	pre-enqueue dedup: reduces queue pressure, m0r0[w=12] now solved
+8ba512d	0.138340	9.1	discard	increase max_nodes 1800→3000: timing regression, tu93 cut off by 300s budget
+bbperruis	0.233846	9.7	keep	sk48 3500 nodes + tr87 600 nodes + WorldModel DSL feedback from BFS
+bw79916pf	0.233846	10.8	keep	fix DSL feedback via preconditions: 231s total (-66s), same score
+bk70nm211	0.233846	21.9	discard	MAX_REPLANS 8→20: no new games solved, ft09 not just-click-anywhere
+bm12qccub	0.198830	10.8	discard	Phase-2 click BFS: 387s total, only 18 episodes, timing regression
+b615w7286	0.209486	10.6	discard	click-only BFS: 327s, 22 episodes, timing regression despite 3s limit cap
+bel88vrhe	0.233846	10.8	discard	click BFS + 3s limit: same score, 283s vs 231s baseline -- more code, slower
+bb83hev97	0.233846	10.8	discard	keyboard+click followup: same score, 283s baseline -- more code, slower
+b4m5o0v3l	0.233846	2.8	discard	skip beam-search when BFS fails: same score but 303s (over budget margin)
+7f87a21	0.326154	10.4	keep	click BFS with camera display-coord scaling: vc33[24]+ft09[6] solved, 283.9s
