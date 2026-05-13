@@ -143,6 +143,17 @@ class Agent:
             planned = self._run_local_search_plan(spec, env, state, t_start)
             if planned is not None:
                 return planned
+            # BFS and click BFS both failed; beam search has never solved any game and
+            # burns 8-14s per episode on animation-heavy games. Return immediately.
+            ep = Episode(
+                task_id=spec.task_id,
+                trajectory=[r.action_id for r in self.executor.history],
+                outcome=False,
+                rhae=0.0,
+                fingerprint=initial_obs.flatten().astype(float),
+            )
+            self.memory.store(ep)
+            return EpisodeResult(spec.task_id, env.actions_taken, False, 0.0)
 
         goal_reached = self.goal_inf.goal_reached(state)
         program_done = False
