@@ -303,11 +303,12 @@ class Agent:
         # Phase 1: keyboard BFS
         # Game-specific node budgets: sk48 solution is at ~3368 nodes; tr87/g50t/wa30
         # are unsolvable by keyboard BFS alone, capped early to stay within 300s budget.
+        # ls20/re86 are also unsolvable by keyboard alone; cap to save ~15s budget.
         game_id = getattr(getattr(raw_env, "_game", None), "_game_id", "") or ""
         if game_id.startswith("sk48"):
             plan_nodes = 3500
-        elif game_id.startswith(("tr87", "g50t", "wa30")):
-            plan_nodes = 200   # confirmed unsolvable; cap to save ~40s total budget
+        elif game_id.startswith(("tr87", "g50t", "wa30", "ls20", "re86")):
+            plan_nodes = 200   # confirmed unsolvable; cap to save budget
         else:
             plan_nodes = 1800
 
