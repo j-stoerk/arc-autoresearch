@@ -33,3 +33,4 @@ bb83hev97	0.233846	10.8	discard	keyboard+click followup: same score, 283s baseli
 b4m5o0v3l	0.233846	2.8	discard	skip beam-search when BFS fails: same score but 303s (over budget margin)
 7f87a21	0.326154	10.4	discard	click BFS with camera display-coord scaling -- timing unstable (283-307s)
 82de7fa	0.326154	10.4	keep	cap g50t/wa30 at 200 nodes: same score, 227s total (-56s), stable timing
+76df9c1	0.403077	10.1	keep	grid-probe fallback: lp85[10]+s5i5[15] solved, 295s total
