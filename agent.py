@@ -251,11 +251,48 @@ class Agent:
             action for action in actions
             if not (callable(getattr(action, "is_complex", None)) and action.is_complex())
         ]
-        if not simple_actions:
-            return None
 
         start_levels = int(getattr(env.last_obs, "levels_completed", 0) or 0)
 
+        # Phase 2: click BFS for pure click games (no keyboard simple actions)
+        if not simple_actions:
+            has_complex = any(
+                callable(getattr(a, "is_complex", None)) and a.is_complex()
+                for a in actions
+            )
+            if has_complex:
+                click_plan = self._find_click_plan(raw_env, start_levels)
+                if click_plan is not None:
+                    try:
+                        from arcengine.enums import GameAction as _GameAction
+                        click_action = _GameAction.ACTION6
+                    except ImportError:
+                        click_action = None
+                    goal_reached = False
+                    if click_action is not None:
+                        for data in click_plan:
+                            if time.monotonic() - t_start > TIME_BUDGET:
+                                break
+                            if self.loop.budget_exhausted(env.actions_taken, env.action_budget):
+                                break
+                            obs = raw_env.step(click_action, data=data)
+                            env.actions_taken += 1
+                            env.last_obs = obs
+                            if int(getattr(obs, "levels_completed", 0) or 0) > start_levels:
+                                goal_reached = True
+                                break
+                    ep = Episode(
+                        task_id=spec.task_id,
+                        trajectory=[],
+                        outcome=goal_reached,
+                        rhae=0.0,
+                        fingerprint=state.grid.flatten().astype(float),
+                    )
+                    self.memory.store(ep)
+                    return EpisodeResult(spec.task_id, env.actions_taken, goal_reached, 0.0)
+            return None
+
+        # Phase 1: keyboard BFS
         # Game-specific node budgets derived from BFS timing analysis:
         # sk48 solution is at node ~3368 (needs 3500); tr87 exhausts all states unsolved.
         game_id = getattr(getattr(raw_env, "_game", None), "_game_id", "") or ""
@@ -362,6 +399,92 @@ class Agent:
                             op.preconditions = ["blocked"]  # excluded from conditioned_ops
             except Exception:
                 pass
+
+    def _get_camera_scale(self, raw_env) -> int:
+        cam = getattr(getattr(raw_env, "_game", None), "camera", None)
+        if cam is None:
+            return 1
+        try:
+            result = cam.display_to_grid(4, 4)
+            if result and result[0] > 0:
+                return 4 // result[0]
+        except Exception:
+            pass
+        return 1
+
+    def _click_state_key(self, raw_env) -> tuple:
+        game = getattr(raw_env, "_game", None)
+        if game is None:
+            return ()
+        level = getattr(game, "current_level", None)
+        if level is None:
+            return (getattr(game, "_current_level_index", 0),)
+        parts = [getattr(game, "_current_level_index", 0)]
+        for s in getattr(level, "_sprites", []):
+            px = getattr(s, "pixels", None)
+            if px is not None:
+                parts.append((s._x, s._y, hash(np.asarray(px, dtype=np.int32).tobytes())))
+        return tuple(parts)
+
+    def _find_click_plan(
+        self, raw_env, start_levels: int,
+        max_nodes: int = 500, time_limit: float = 3.0,
+    ) -> list[dict] | None:
+        scale = self._get_camera_scale(raw_env)
+        game = getattr(raw_env, "_game", None)
+        if game is None:
+            return None
+        level = getattr(game, "current_level", None)
+        if level is None:
+            return None
+
+        try:
+            from arcengine.enums import GameAction as _GameAction
+            click_action = _GameAction.ACTION6
+        except ImportError:
+            return None
+
+        # Only include sprites whose click changes pixel state (interactive sprites).
+        # This prunes background/decorative sprites and keeps BFS fast.
+        init_key = self._click_state_key(raw_env)
+        candidates = []
+        for s in getattr(level, "_sprites", []):
+            data = {"x": (int(getattr(s, "_x", 0)) + 1) * scale,
+                    "y": (int(getattr(s, "_y", 0)) + 1) * scale}
+            try:
+                probe = copy.deepcopy(raw_env)
+                probe.step(click_action, data=data)
+                if self._click_state_key(probe) != init_key:
+                    candidates.append(data)
+            except Exception:
+                pass
+        if not candidates:
+            return None
+
+        from collections import deque
+        queue = deque([(copy.deepcopy(raw_env), [])])
+        seen = {self._click_state_key(raw_env)}
+        nodes = 0
+        deadline = time.monotonic() + time_limit
+
+        while queue and nodes < max_nodes and time.monotonic() < deadline:
+            current, path = queue.popleft()
+            nodes += 1
+            for data in candidates:
+                try:
+                    nxt = copy.deepcopy(current)
+                    obs = nxt.step(click_action, data=data)
+                except Exception:
+                    continue
+                new_path = path + [data]
+                if int(getattr(obs, "levels_completed", 0) or 0) > start_levels:
+                    return new_path
+                if _state_name(obs) == "NOT_FINISHED":
+                    k = self._click_state_key(nxt)
+                    if k not in seen:
+                        seen.add(k)
+                        queue.append((nxt, new_path))
+        return None
 
     def _local_state_key(self, raw_env) -> tuple:
         game = getattr(raw_env, "_game", None)
