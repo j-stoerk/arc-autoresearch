@@ -320,6 +320,12 @@ class Agent:
             plan_nodes = 3500
         elif game_id.startswith(("tr87", "g50t", "wa30", "ls20", "re86")):
             plan_nodes = 200   # confirmed unsolvable; cap to save budget
+        elif game_id.startswith("cn04"):
+            plan_nodes = 300   # exhausted at 247 unique states; cap just above
+        elif game_id.startswith("ka59"):
+            plan_nodes = 100   # exhausted at 74 unique states; cap just above
+        elif game_id.startswith("dc22"):
+            plan_nodes = 20    # exhausted at 9 unique keyboard states; cap just above
         else:
             plan_nodes = 1800
 
