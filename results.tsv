@@ -37,5 +37,6 @@ b4m5o0v3l	0.233846	2.8	discard	skip beam-search when BFS fails: same score but 3
 fb5f790	0.403077	10.1	keep	cap ls20+re86 at 200 nodes: same score, 295s stable, r11l+sb26 confirmed unsolvable
 db1662a	0.403077	3.4	keep	skip beam search when BFS fails: same score, ~248s on normal machine (-47s)
 c9d3d21	0.403077	3.9	keep	tight node caps for cn04/ka59/dc22: saves ~5s more (machine loaded today, stable on normal)
-HEAD	0.403077	3.8	keep	gc.disable() around BFS loops + sprite-extent bbox + greedy-by-score Phase3: ~248s→167s (-81s), same score
+8806ad2	0.403077	3.8	keep	gc.disable() around BFS loops + sprite-extent bbox + greedy-by-score Phase3: ~248s→167s (-81s), same score
 (r11l[13]: BFS with 3 sprite cands exhausts at 21 states; 198 mid-sequence background positions needed; sprite discovery finds sprite[2]@(6,35) dynamically active; 4-sprite BFS exhausts ~100 states no WIN; greedy fails (all-or-nothing score); deepcopy 4.5ms x 201 cands = 0.9s/node too slow for any BFS approach)
+(tn36[22]: click-only game confirmed; BFS with 30 sprite-center cands exhausts ~600 unique states in ~107s no WIN -- confirmed unsolvable via sprite-center click BFS)
