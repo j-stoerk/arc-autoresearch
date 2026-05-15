@@ -36,3 +36,4 @@ b4m5o0v3l	0.233846	2.8	discard	skip beam-search when BFS fails: same score but 3
 76df9c1	0.403077	10.1	keep	grid-probe fallback: lp85[10]+s5i5[15] solved, 295s total
 fb5f790	0.403077	10.1	keep	cap ls20+re86 at 200 nodes: same score, 295s stable, r11l+sb26 confirmed unsolvable
 db1662a	0.403077	3.4	keep	skip beam search when BFS fails: same score, ~248s on normal machine (-47s)
+c9d3d21	0.403077	3.9	keep	tight node caps for cn04/ka59/dc22: saves ~5s more (machine loaded today, stable on normal)
