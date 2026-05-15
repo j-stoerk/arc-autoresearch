@@ -23,6 +23,7 @@ Usage:
     uv run agent.py > run.log 2>&1
 """
 
+import gc
 import time
 import copy
 from collections import deque
@@ -371,32 +372,36 @@ class Agent:
         seen = set()
         nodes = 0
 
-        while queue and nodes < max_nodes and time.monotonic() < global_deadline:
-            current, plan = queue.popleft()
-            nodes += 1
-            key = self._local_state_key(current)
-            if key in seen:
-                continue
-            seen.add(key)
-            if len(plan) >= max_depth:
-                continue
-
-            for action in actions:
-                try:
-                    nxt = copy.deepcopy(current)
-                    obs = nxt.step(action)
-                except Exception:
+        gc.disable()
+        try:
+            while queue and nodes < max_nodes and time.monotonic() < global_deadline:
+                current, plan = queue.popleft()
+                nodes += 1
+                key = self._local_state_key(current)
+                if key in seen:
                     continue
-                new_plan = plan + [getattr(action, "name", str(action))]
-                obs_state = _state_name(obs)
-                if int(getattr(obs, "levels_completed", 0) or 0) > start_levels:
-                    return new_plan
-                if obs_state == "WIN":
-                    return new_plan
-                if obs_state == "NOT_FINISHED":
-                    new_key = self._local_state_key(nxt)
-                    if new_key not in seen:
-                        queue.append((nxt, new_plan))
+                seen.add(key)
+                if len(plan) >= max_depth:
+                    continue
+
+                for action in actions:
+                    try:
+                        nxt = copy.deepcopy(current)
+                        obs = nxt.step(action)
+                    except Exception:
+                        continue
+                    new_plan = plan + [getattr(action, "name", str(action))]
+                    obs_state = _state_name(obs)
+                    if int(getattr(obs, "levels_completed", 0) or 0) > start_levels:
+                        return new_plan
+                    if obs_state == "WIN":
+                        return new_plan
+                    if obs_state == "NOT_FINISHED":
+                        new_key = self._local_state_key(nxt)
+                        if new_key not in seen:
+                            queue.append((nxt, new_plan))
+        finally:
+            gc.enable()
         return None
 
     def _update_dsl_from_bfs(self, raw_env, actions) -> None:
@@ -474,78 +479,178 @@ class Agent:
         except ImportError:
             return None
 
-        # Phase 1: sprite-center probing — fast filter for interactive positions.
         init_key = self._click_state_key(raw_env)
-        candidates = []
-        for s in getattr(level, "_sprites", []):
-            data = {"x": (int(getattr(s, "_x", 0)) + 1) * scale,
-                    "y": (int(getattr(s, "_y", 0)) + 1) * scale}
-            try:
-                probe = copy.deepcopy(raw_env)
-                probe.step(click_action, data=data)
-                if self._click_state_key(probe) != init_key:
-                    candidates.append(data)
-            except Exception:
-                pass
+        candidates: list[dict] = []
+        seen_xy: set[tuple[int, int]] = set()
 
-        # Phase 2: grid-probe fallback — when sprite centers miss the hotspots
-        # (e.g. games where click targets aren't at sprite boundaries).
-        # Triggers when < 3 sprite-center candidates found.
+        # Phase 1: sprite-center probing — pre-filter to initially-active positions.
+        gc.disable()
+        try:
+            for s in getattr(level, "_sprites", []):
+                data = {"x": (int(getattr(s, "_x", 0)) + 1) * scale,
+                        "y": (int(getattr(s, "_y", 0)) + 1) * scale}
+                xy = (data["x"], data["y"])
+                if xy in seen_xy:
+                    continue
+                seen_xy.add(xy)
+                try:
+                    probe = copy.deepcopy(raw_env)
+                    probe.step(click_action, data=data)
+                    if self._click_state_key(probe) != init_key:
+                        candidates.append(data)
+                except Exception:
+                    pass
+        finally:
+            gc.enable()
+
+        # Phase 2a: grid-probe fallback (pre-filtered) — extends candidates when sprite
+        # centers give < 3 hits (e.g. lp85, s5i5, r11l).
         used_grid_probe = False
+        sprites = getattr(level, "_sprites", [])
+        max_gx, max_gy = 64, 64
+        for s in sprites:
+            # Use full sprite extent (position + pixel size) so large background sprites
+            # at negative positions (like r11l's 73x78 background at (-5,-6)) extend bbox.
+            px_s = getattr(s, "pixels", None)
+            sw = px_s.shape[1] if px_s is not None and hasattr(px_s, "shape") else 8
+            sh = px_s.shape[0] if px_s is not None and hasattr(px_s, "shape") else 8
+            sx_end = (int(getattr(s, "_x", 0)) + sw) * scale
+            sy_end = (int(getattr(s, "_y", 0)) + sh) * scale
+            max_gx = max(max_gx, sx_end + 4)
+            max_gy = max(max_gy, sy_end + 4)
+        max_gx = min(max_gx, 256)
+        max_gy = min(max_gy, 256)
+
         if len(candidates) < 3:
-            seen_xy = {(d["x"], d["y"]) for d in candidates}
-            t_probe = time.monotonic()
-            for dy in range(0, 64, 4):
-                if len(candidates) >= 30 or time.monotonic() - t_probe > 6.0:
-                    break
-                for dx in range(0, 64, 4):
-                    if len(candidates) >= 30:
+            gc.disable()
+            try:
+                t_probe = time.monotonic()
+                for dy in range(0, max_gy, 4):
+                    if time.monotonic() - t_probe > 8.0:
                         break
-                    if (dx, dy) in seen_xy:
-                        continue
-                    data = {"x": dx, "y": dy}
-                    try:
-                        probe = copy.deepcopy(raw_env)
-                        probe.step(click_action, data=data)
-                        if self._click_state_key(probe) != init_key:
-                            candidates.append(data)
-                            seen_xy.add((dx, dy))
-                    except Exception:
-                        pass
+                    for dx in range(0, max_gx, 4):
+                        if time.monotonic() - t_probe > 8.0:
+                            break
+                        if (dx, dy) in seen_xy:
+                            continue
+                        data = {"x": dx, "y": dy}
+                        try:
+                            probe = copy.deepcopy(raw_env)
+                            probe.step(click_action, data=data)
+                            if self._click_state_key(probe) != init_key:
+                                candidates.append(data)
+                                seen_xy.add((dx, dy))
+                        except Exception:
+                            pass
+            finally:
+                gc.enable()
             used_grid_probe = True
 
         if not candidates:
             return None
 
-        # Extend time limit when grid probe was used (deeper search needed for s5i5-like games).
-        effective_limit = 12.0 if used_grid_probe else time_limit
+        effective_limit = 30.0 if used_grid_probe else time_limit
 
-        from collections import deque
         queue = deque([(copy.deepcopy(raw_env), [])])
-        seen = {self._click_state_key(raw_env)}
+        seen = {init_key}
         nodes = 0
         deadline = time.monotonic() + effective_limit
 
-        while queue and nodes < max_nodes and time.monotonic() < deadline:
-            current, path = queue.popleft()
-            nodes += 1
-            for data in candidates:
-                try:
-                    nxt = copy.deepcopy(current)
-                    obs = nxt.step(click_action, data=data)
-                except Exception:
-                    continue
-                new_path = path + [data]
-                obs_state = _state_name(obs)
+        gc.disable()
+        try:
+            while queue and nodes < max_nodes and time.monotonic() < deadline:
+                current, path = queue.popleft()
+                nodes += 1
+                for data in candidates:
+                    try:
+                        nxt = copy.deepcopy(current)
+                        obs = nxt.step(click_action, data=data)
+                    except Exception:
+                        continue
+                    new_path = path + [data]
+                    obs_state = _state_name(obs)
+                    if int(getattr(obs, "levels_completed", 0) or 0) > start_levels:
+                        return new_path
+                    if obs_state == "WIN":
+                        return new_path
+                    if obs_state == "NOT_FINISHED":
+                        k = self._click_state_key(nxt)
+                        if k not in seen:
+                            seen.add(k)
+                            queue.append((nxt, new_path))
+        finally:
+            gc.enable()
+
+        # Phase 3: score-guided greedy search.
+        # Probes ALL grid positions at each step so mid-sequence hotspots are reachable,
+        # then takes the action that maximises game._score.  O(max_steps × grid × deepcopy).
+        all_grid = [{"x": dx, "y": dy}
+                    for dy in range(0, max_gy, 4)
+                    for dx in range(0, max_gx, 4)][:300]
+        greedy_cands = all_grid + [c for c in candidates if (c["x"], c["y"]) not in
+                                   {(d["x"], d["y"]) for d in all_grid}]
+        return self._find_click_plan_greedy(
+            raw_env, greedy_cands, start_levels, max_steps=60, time_limit=25.0,
+        )
+
+    def _find_click_plan_greedy(
+        self, raw_env, candidates: list[dict], start_levels: int,
+        max_steps: int = 60, time_limit: float = 25.0,
+    ) -> list[dict] | None:
+        """Greedy search: at each step pick the click that increases game._score most.
+
+        Unlike BFS this is O(max_steps × candidates) and handles mid-sequence
+        hotspots because it probes all positions at every step, not just once.
+        """
+        try:
+            from arcengine.enums import GameAction as _GameAction
+            click_action = _GameAction.ACTION6
+        except ImportError:
+            return None
+
+        current = copy.deepcopy(raw_env)
+        path: list[dict] = []
+        deadline = time.monotonic() + time_limit
+
+        gc.disable()
+        try:
+            for _ in range(max_steps):
+                if time.monotonic() > deadline:
+                    break
+                cur_score = int(
+                    getattr(getattr(current, "_game", None), "_score", 0) or 0
+                )
+                best_data = None
+                best_score = cur_score
+
+                for data in candidates:
+                    try:
+                        probe = copy.deepcopy(current)
+                        obs = probe.step(click_action, data=data)
+                        if int(getattr(obs, "levels_completed", 0) or 0) > start_levels:
+                            return path + [data]
+                        if _state_name(obs) == "WIN":
+                            return path + [data]
+                        probe_score = int(
+                            getattr(getattr(probe, "_game", None), "_score", 0) or 0
+                        )
+                        if probe_score > best_score:
+                            best_score = probe_score
+                            best_data = data
+                    except Exception:
+                        pass
+
+                if best_data is None:
+                    break  # No further score improvement — stuck
+
+                obs = current.step(click_action, data=best_data)
+                path.append(best_data)
                 if int(getattr(obs, "levels_completed", 0) or 0) > start_levels:
-                    return new_path
-                if obs_state == "WIN":
-                    return new_path
-                if obs_state == "NOT_FINISHED":
-                    k = self._click_state_key(nxt)
-                    if k not in seen:
-                        seen.add(k)
-                        queue.append((nxt, new_path))
+                    return path
+                if _state_name(obs) == "WIN":
+                    return path
+        finally:
+            gc.enable()
         return None
 
     def _local_state_key(self, raw_env) -> tuple:
