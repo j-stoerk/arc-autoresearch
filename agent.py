@@ -24,6 +24,7 @@ Usage:
 """
 
 import gc
+import heapq
 import time
 import copy
 from collections import deque
@@ -366,21 +367,39 @@ class Agent:
 
     def _find_level_plan(self, raw_env, actions, start_levels: int, max_nodes: int = 1800,
                          global_deadline: float = float("inf")) -> list[str] | None:
+        """True A* search with f = g + h, h = win_score - current_score.
+
+        For games where each correct action increments score by 1, h is exact and
+        A* explores only the optimal path (D nodes for a D-step solution vs BFS's
+        exponential expansion). Falls back to BFS-equivalent when score is flat.
+        """
         max_depth = 40
 
-        queue = deque([(copy.deepcopy(raw_env), [])])
-        seen = set()
+        def _game_score(env):
+            g = getattr(env, "_game", None)
+            return int(getattr(g, "_score", 0) or 0) if g else 0
+
+        def _win_score(env):
+            g = getattr(env, "_game", None)
+            return int(getattr(g, "_win_score", 1000) or 1000) if g else 1000
+
+        ws = _win_score(raw_env)
+        # Heap: (f, g_cost, counter, env_copy, plan)
+        ctr = 0
+        h0 = ws - _game_score(raw_env)
+        heap = [(h0, 0, ctr, copy.deepcopy(raw_env), [])]
+        best_g: dict = {}
         nodes = 0
 
         gc.disable()
         try:
-            while queue and nodes < max_nodes and time.monotonic() < global_deadline:
-                current, plan = queue.popleft()
+            while heap and nodes < max_nodes and time.monotonic() < global_deadline:
+                f, g, _, current, plan = heapq.heappop(heap)
                 nodes += 1
                 key = self._local_state_key(current)
-                if key in seen:
+                if key in best_g and best_g[key] <= g:
                     continue
-                seen.add(key)
+                best_g[key] = g
                 if len(plan) >= max_depth:
                     continue
 
@@ -397,9 +416,12 @@ class Agent:
                     if obs_state == "WIN":
                         return new_plan
                     if obs_state == "NOT_FINISHED":
+                        new_g = g + 1
                         new_key = self._local_state_key(nxt)
-                        if new_key not in seen:
-                            queue.append((nxt, new_plan))
+                        if new_key not in best_g or best_g[new_key] > new_g:
+                            new_h = ws - _game_score(nxt)
+                            ctr += 1
+                            heapq.heappush(heap, (new_g + new_h, new_g, ctr, nxt, new_plan))
         finally:
             gc.enable()
         return None
