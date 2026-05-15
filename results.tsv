@@ -39,6 +39,9 @@ db1662a	0.403077	3.4	keep	skip beam search when BFS fails: same score, ~248s on 
 c9d3d21	0.403077	3.9	keep	tight node caps for cn04/ka59/dc22: saves ~5s more (machine loaded today, stable on normal)
 8806ad2	0.403077	3.8	discard	gc.disable() + greedy Phase3 (tn36 greedy runs 5 steps but Phase3 adds overhead, cleaner without)
 e823fb6	0.403077	3.8	keep	gc.disable() around all BFS loops + sprite-extent bbox: ~248s→161s (-87s), same score
-HEAD	0.403077	3.8	keep	A* keyboard BFS (f=g+h, h=win_score-score): sk48 100s→75s, total 161s→136s (-25s), same score
+99d217a	0.403077	3.8	keep	A* keyboard BFS (f=g+h, h=win_score-score): sk48 100s→75s, total 161s→136s (-25s), same score
+(r11l needs 187s total: 24s discovery + 163s BFS with 201 cands; budget=164s; 23s gap; confirmed unsolvable within 300s budget even with gc.disable()+A*)
+(lf52/bp35: confirmed zero position+tag changes for any click; truly opaque with no observable state change via either pixel-hash or position+tag keys)
+(tn36: confirmed zero non-sprite-center grid positions from initial state; sprite BFS exhausted ~600 states; confirmed unsolvable via sprite-click approach)
 (r11l[13]: BFS with 3 sprite cands exhausts at 21 states; 198 mid-sequence background positions needed; sprite discovery finds sprite[2]@(6,35) dynamically active; 4-sprite BFS exhausts ~100 states no WIN; greedy fails (all-or-nothing score); deepcopy 4.5ms x 201 cands = 0.9s/node too slow for any BFS approach)
 (tn36[22]: click-only game, 30 sprite-center cands, BFS exhausts ~600 unique states in ~107s no WIN; greedy runs 5 score-improvement steps (sprite score is incremental!) then gets stuck; confirmed unsolvable via sprite-click BFS within 300s budget)
