@@ -84,12 +84,7 @@ class Perception:
     # ------------------------------------------------------------------ #
 
     def local_state_key(self, raw_env) -> tuple:
-        """Position+name+tag state key for keyboard BFS.
-
-        Includes sprite name because some games (e.g. tr87) cycle sprites by
-        replacing them with identically-positioned sprites of different names —
-        position+tags alone would see all configurations as identical.
-        """
+        """Position+tag state key for keyboard BFS."""
         game = getattr(raw_env, "_game", None)
         if game is None:
             return (id(raw_env),)
@@ -99,14 +94,12 @@ class Perception:
         if level is not None:
             for s in getattr(level, "_sprites", []):
                 tags = tuple(sorted(getattr(s, "tags", [])))
-                parts.append((int(getattr(s, "_x", 0)), int(getattr(s, "_y", 0)),
-                               tags, getattr(s, "name", "")))
+                parts.append((int(getattr(s, "_x", 0)), int(getattr(s, "_y", 0)), tags))
         else:
             for v in vars(game).values():
                 if hasattr(v, "pixels") and hasattr(v, "_x") and hasattr(v, "_y"):
                     tags = tuple(sorted(getattr(v, "tags", [])))
-                    parts.append((int(getattr(v, "_x", 0)), int(getattr(v, "_y", 0)),
-                                   tags, getattr(v, "name", "")))
+                    parts.append((int(getattr(v, "_x", 0)), int(getattr(v, "_y", 0)), tags))
         return tuple(parts)
 
     # ------------------------------------------------------------------ #
@@ -130,8 +123,7 @@ class Perception:
             if i < len(sprites):
                 s = sprites[i]
                 tags = tuple(sorted(getattr(s, "tags", [])))
-                parts.append((int(getattr(s, "_x", 0)), int(getattr(s, "_y", 0)),
-                               tags, getattr(s, "name", "")))
+                parts.append((int(getattr(s, "_x", 0)), int(getattr(s, "_y", 0)), tags))
         return tuple(parts)
 
     @staticmethod
