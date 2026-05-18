@@ -78,3 +78,54 @@ class Perception:
             delta = (grid != self._prev_grid)
         self._prev_grid = grid.copy()
         return StateRepr(grid=grid, objects=objects, delta=delta)
+
+    # ------------------------------------------------------------------ #
+    # State-key helpers (used by BFS in Search)                            #
+    # ------------------------------------------------------------------ #
+
+    def local_state_key(self, raw_env) -> tuple:
+        """Position+tag state key for keyboard BFS."""
+        game = getattr(raw_env, "_game", None)
+        if game is None:
+            return (id(raw_env),)
+
+        parts = [getattr(game, "_current_level_index", 0)]
+        level = getattr(game, "current_level", None)
+        if level is not None:
+            for s in getattr(level, "_sprites", []):
+                tags = tuple(sorted(getattr(s, "tags", [])))
+                parts.append((int(getattr(s, "_x", 0)), int(getattr(s, "_y", 0)), tags))
+        else:
+            for v in vars(game).values():
+                if hasattr(v, "pixels") and hasattr(v, "_x") and hasattr(v, "_y"):
+                    tags = tuple(sorted(getattr(v, "tags", [])))
+                    parts.append((int(getattr(v, "_x", 0)), int(getattr(v, "_y", 0)), tags))
+        return tuple(parts)
+
+    def click_state_key(self, raw_env) -> tuple:
+        """Pixel-hash state key for click BFS."""
+        game = getattr(raw_env, "_game", None)
+        if game is None:
+            return ()
+        level = getattr(game, "current_level", None)
+        if level is None:
+            return (getattr(game, "_current_level_index", 0),)
+        parts = [getattr(game, "_current_level_index", 0)]
+        for s in getattr(level, "_sprites", []):
+            px = getattr(s, "pixels", None)
+            if px is not None:
+                parts.append((s._x, s._y, hash(np.asarray(px, dtype=np.int32).tobytes())))
+        return tuple(parts)
+
+    def camera_scale(self, raw_env) -> int:
+        """Detect display-to-grid scale factor."""
+        cam = getattr(getattr(raw_env, "_game", None), "camera", None)
+        if cam is None:
+            return 1
+        try:
+            result = cam.display_to_grid(4, 4)
+            if result and result[0] > 0:
+                return 4 // result[0]
+        except Exception:
+            pass
+        return 1

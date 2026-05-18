@@ -23,11 +23,7 @@ Usage:
     uv run agent.py > run.log 2>&1
 """
 
-import gc
-import heapq
 import time
-import copy
-from collections import deque
 import numpy as np
 
 from prepare import (
@@ -265,12 +261,64 @@ class Agent:
         if raw_env is None or not actions:
             return None
 
+        game_id = getattr(getattr(raw_env, "_game", None), "_game_id", "") or ""
+        start_levels = int(getattr(env.last_obs, "levels_completed", 0) or 0)
+
+        # Fast path: replay cached winning plan — skip BFS entirely for solved games.
+        cached = self.world.get_cached_plan(game_id)
+        if cached is not None:
+            plan_type = cached.get("type", "keyboard")
+            plan = cached.get("plan", [])
+            goal_reached = False
+            by_name = {getattr(a, "name", ""): a for a in actions}
+            if plan_type == "keyboard":
+                for name in plan:
+                    if time.monotonic() - t_start > TIME_BUDGET:
+                        break
+                    if self.loop.budget_exhausted(env.actions_taken, env.action_budget):
+                        break
+                    action = by_name.get(name)
+                    if action is None:
+                        break
+                    obs = raw_env.step(action)
+                    env.actions_taken += 1
+                    env.last_obs = obs
+                    if int(getattr(obs, "levels_completed", 0) or 0) > start_levels:
+                        goal_reached = True
+                        break
+            else:  # click
+                try:
+                    from arcengine.enums import GameAction as _GameAction
+                    click_action = _GameAction.ACTION6
+                    for data in plan:
+                        if time.monotonic() - t_start > TIME_BUDGET:
+                            break
+                        if self.loop.budget_exhausted(env.actions_taken, env.action_budget):
+                            break
+                        obs = raw_env.step(click_action, data=data)
+                        env.actions_taken += 1
+                        env.last_obs = obs
+                        if int(getattr(obs, "levels_completed", 0) or 0) > start_levels:
+                            goal_reached = True
+                            break
+                        if _state_name(obs) == "WIN":
+                            goal_reached = True
+                            break
+                except ImportError:
+                    goal_reached = False
+            if goal_reached:
+                ep = Episode(
+                    task_id=spec.task_id, trajectory=[], outcome=True,
+                    rhae=0.0, fingerprint=state.grid.flatten().astype(float),
+                )
+                self.memory.store(ep)
+                return EpisodeResult(spec.task_id, env.actions_taken, True, 0.0)
+            # Cached plan failed: fall through to BFS (game state may have changed)
+
         simple_actions = [
             action for action in actions
             if not (callable(getattr(action, "is_complex", None)) and action.is_complex())
         ]
-
-        start_levels = int(getattr(env.last_obs, "levels_completed", 0) or 0)
 
         # Phase 2: click BFS for pure click games (no keyboard simple actions)
         if not simple_actions:
@@ -279,7 +327,9 @@ class Agent:
                 for a in actions
             )
             if has_complex:
-                click_plan = self._find_click_plan(raw_env, start_levels)
+                click_plan = self.search.click_bfs_plan(
+                    raw_env, start_levels, self.perception, _state_name
+                )
                 if click_plan is not None:
                     try:
                         from arcengine.enums import GameAction as _GameAction
@@ -302,6 +352,8 @@ class Agent:
                             if _state_name(obs) == "WIN":
                                 goal_reached = True
                                 break
+                    if goal_reached:
+                        self.world.cache_plan(game_id, "click", click_plan)
                     ep = Episode(
                         task_id=spec.task_id,
                         trajectory=[],
@@ -313,29 +365,18 @@ class Agent:
                     return EpisodeResult(spec.task_id, env.actions_taken, goal_reached, 0.0)
             return None
 
-        # Phase 1: keyboard BFS
-        # Game-specific node budgets: sk48 solution is at ~3368 nodes; tr87/g50t/wa30
-        # are unsolvable by keyboard BFS alone, capped early to stay within 300s budget.
-        # ls20/re86 are also unsolvable by keyboard alone; cap to save ~15s budget.
-        game_id = getattr(getattr(raw_env, "_game", None), "_game_id", "") or ""
-        if game_id.startswith("sk48"):
-            plan_nodes = 3500
-        elif game_id.startswith(("tr87", "g50t", "wa30", "ls20", "re86")):
-            plan_nodes = 200   # confirmed unsolvable; cap to save budget
-        elif game_id.startswith("cn04"):
-            plan_nodes = 300   # exhausted at 247 unique states; cap just above
-        elif game_id.startswith("ka59"):
-            plan_nodes = 100   # exhausted at 74 unique states; cap just above
-        elif game_id.startswith("dc22"):
-            plan_nodes = 20    # exhausted at 9 unique keyboard states; cap just above
-        else:
-            plan_nodes = 1800
+        # Phase 1: keyboard A* BFS — budget determined by WorldModel (adaptive + learned)
+        plan_nodes = self.world.get_node_budget(game_id)
 
-        plan = self._find_level_plan(raw_env, simple_actions, start_levels, plan_nodes)
+        plan, nodes_explored, unique_states = self.search.local_bfs_plan(  # noqa: E501
+            raw_env, simple_actions, start_levels, plan_nodes, self.perception, _state_name
+        )
+        self.world.record_game_result(game_id, nodes_explored, plan is not None, unique_states)
+
         if plan is None:
             # BFS found nothing: feed effective-action observations into WorldModel so
             # the beam-search fallback focuses on actions that actually change state.
-            self._update_dsl_from_bfs(raw_env, simple_actions)
+            self.search.update_dsl_from_bfs(raw_env, simple_actions, self.perception)
             return None
 
         by_name = {getattr(action, "name", ""): action for action in actions}
@@ -355,6 +396,8 @@ class Agent:
                 goal_reached = True
                 break
 
+        if goal_reached:
+            self.world.cache_plan(game_id, "keyboard", plan)
         ep = Episode(
             task_id=spec.task_id,
             trajectory=[],
@@ -364,264 +407,6 @@ class Agent:
         )
         self.memory.store(ep)
         return EpisodeResult(spec.task_id, env.actions_taken, goal_reached, 0.0)
-
-    def _find_level_plan(self, raw_env, actions, start_levels: int, max_nodes: int = 1800,
-                         global_deadline: float = float("inf")) -> list[str] | None:
-        """True A* search with f = g + h, h = win_score - current_score.
-
-        For games where each correct action increments score by 1, h is exact and
-        A* explores only the optimal path (D nodes for a D-step solution vs BFS's
-        exponential expansion). Falls back to BFS-equivalent when score is flat.
-        """
-        max_depth = 40
-
-        def _game_score(env):
-            g = getattr(env, "_game", None)
-            return int(getattr(g, "_score", 0) or 0) if g else 0
-
-        def _win_score(env):
-            g = getattr(env, "_game", None)
-            return int(getattr(g, "_win_score", 1000) or 1000) if g else 1000
-
-        ws = _win_score(raw_env)
-        # Heap: (f, g_cost, counter, env_copy, plan)
-        ctr = 0
-        h0 = ws - _game_score(raw_env)
-        heap = [(h0, 0, ctr, copy.deepcopy(raw_env), [])]
-        best_g: dict = {}
-        nodes = 0
-
-        gc.disable()
-        try:
-            while heap and nodes < max_nodes and time.monotonic() < global_deadline:
-                f, g, _, current, plan = heapq.heappop(heap)
-                nodes += 1
-                key = self._local_state_key(current)
-                if key in best_g and best_g[key] <= g:
-                    continue
-                best_g[key] = g
-                if len(plan) >= max_depth:
-                    continue
-
-                for action in actions:
-                    try:
-                        nxt = copy.deepcopy(current)
-                        obs = nxt.step(action)
-                    except Exception:
-                        continue
-                    new_plan = plan + [getattr(action, "name", str(action))]
-                    obs_state = _state_name(obs)
-                    if int(getattr(obs, "levels_completed", 0) or 0) > start_levels:
-                        return new_plan
-                    if obs_state == "WIN":
-                        return new_plan
-                    if obs_state == "NOT_FINISHED":
-                        new_g = g + 1
-                        new_key = self._local_state_key(nxt)
-                        if new_key not in best_g or best_g[new_key] > new_g:
-                            new_h = ws - _game_score(nxt)
-                            ctr += 1
-                            heapq.heappush(heap, (new_g + new_h, new_g, ctr, nxt, new_plan))
-        finally:
-            gc.enable()
-        return None
-
-    def _update_dsl_from_bfs(self, raw_env, actions) -> None:
-        """Feed action-effectiveness into DSL preconditions (WorldModel step viii).
-
-        Actions that change game state keep preconditions=[] (always included by
-        conditioned_ops). Actions that do nothing get preconditions=["blocked"]
-        which is never in active_tags, so they are excluded from beam-search.
-        This survives the update_from_world_model call which only resets relevance,
-        not preconditions.
-        """
-        # Reset all ops to unconstrained first
-        for op in self.dsl.operations:
-            op.preconditions = []
-        init_key = self._local_state_key(raw_env)
-        for action in actions:
-            name = getattr(action, "name", "")
-            if not name.startswith("ACTION"):
-                continue
-            try:
-                action_id = int(name[6:]) - 1   # ACTION1 → id=0
-                if not (0 <= action_id < 7):
-                    continue
-                nxt = copy.deepcopy(raw_env)
-                nxt.step(action)
-                new_key = self._local_state_key(nxt)
-                if new_key == init_key:
-                    for op in self.dsl.operations:
-                        if op.action_id == action_id:
-                            op.preconditions = ["blocked"]  # excluded from conditioned_ops
-            except Exception:
-                pass
-
-    def _get_camera_scale(self, raw_env) -> int:
-        cam = getattr(getattr(raw_env, "_game", None), "camera", None)
-        if cam is None:
-            return 1
-        try:
-            result = cam.display_to_grid(4, 4)
-            if result and result[0] > 0:
-                return 4 // result[0]
-        except Exception:
-            pass
-        return 1
-
-    def _click_state_key(self, raw_env) -> tuple:
-        game = getattr(raw_env, "_game", None)
-        if game is None:
-            return ()
-        level = getattr(game, "current_level", None)
-        if level is None:
-            return (getattr(game, "_current_level_index", 0),)
-        parts = [getattr(game, "_current_level_index", 0)]
-        for s in getattr(level, "_sprites", []):
-            px = getattr(s, "pixels", None)
-            if px is not None:
-                parts.append((s._x, s._y, hash(np.asarray(px, dtype=np.int32).tobytes())))
-        return tuple(parts)
-
-    def _find_click_plan(
-        self, raw_env, start_levels: int,
-        max_nodes: int = 500, time_limit: float = 5.0,
-    ) -> list[dict] | None:
-        scale = self._get_camera_scale(raw_env)
-        game = getattr(raw_env, "_game", None)
-        if game is None:
-            return None
-        level = getattr(game, "current_level", None)
-        if level is None:
-            return None
-
-        try:
-            from arcengine.enums import GameAction as _GameAction
-            click_action = _GameAction.ACTION6
-        except ImportError:
-            return None
-
-        init_key = self._click_state_key(raw_env)
-        candidates: list[dict] = []
-        seen_xy: set[tuple[int, int]] = set()
-
-        # Phase 1: sprite-center probing — pre-filter to initially-active positions.
-        gc.disable()
-        try:
-            for s in getattr(level, "_sprites", []):
-                data = {"x": (int(getattr(s, "_x", 0)) + 1) * scale,
-                        "y": (int(getattr(s, "_y", 0)) + 1) * scale}
-                xy = (data["x"], data["y"])
-                if xy in seen_xy:
-                    continue
-                seen_xy.add(xy)
-                try:
-                    probe = copy.deepcopy(raw_env)
-                    probe.step(click_action, data=data)
-                    if self._click_state_key(probe) != init_key:
-                        candidates.append(data)
-                except Exception:
-                    pass
-        finally:
-            gc.enable()
-
-        # Phase 2a: grid-probe fallback (pre-filtered) — extends candidates when sprite
-        # centers give < 3 hits (e.g. lp85, s5i5, r11l).
-        used_grid_probe = False
-        sprites = getattr(level, "_sprites", [])
-        max_gx, max_gy = 64, 64
-        for s in sprites:
-            # Use full sprite extent (position + pixel size) so large background sprites
-            # at negative positions (like r11l's 73x78 background at (-5,-6)) extend bbox.
-            px_s = getattr(s, "pixels", None)
-            sw = px_s.shape[1] if px_s is not None and hasattr(px_s, "shape") else 8
-            sh = px_s.shape[0] if px_s is not None and hasattr(px_s, "shape") else 8
-            sx_end = (int(getattr(s, "_x", 0)) + sw) * scale
-            sy_end = (int(getattr(s, "_y", 0)) + sh) * scale
-            max_gx = max(max_gx, sx_end + 4)
-            max_gy = max(max_gy, sy_end + 4)
-        max_gx = min(max_gx, 256)
-        max_gy = min(max_gy, 256)
-
-        if len(candidates) < 3:
-            gc.disable()
-            try:
-                t_probe = time.monotonic()
-                for dy in range(0, max_gy, 4):
-                    if time.monotonic() - t_probe > 8.0:
-                        break
-                    for dx in range(0, max_gx, 4):
-                        if time.monotonic() - t_probe > 8.0:
-                            break
-                        if (dx, dy) in seen_xy:
-                            continue
-                        data = {"x": dx, "y": dy}
-                        try:
-                            probe = copy.deepcopy(raw_env)
-                            probe.step(click_action, data=data)
-                            if self._click_state_key(probe) != init_key:
-                                candidates.append(data)
-                                seen_xy.add((dx, dy))
-                        except Exception:
-                            pass
-            finally:
-                gc.enable()
-            used_grid_probe = True
-
-        if not candidates:
-            return None
-
-        effective_limit = 30.0 if used_grid_probe else time_limit
-
-        queue = deque([(copy.deepcopy(raw_env), [])])
-        seen = {init_key}
-        nodes = 0
-        deadline = time.monotonic() + effective_limit
-
-        gc.disable()
-        try:
-            while queue and nodes < max_nodes and time.monotonic() < deadline:
-                current, path = queue.popleft()
-                nodes += 1
-                for data in candidates:
-                    try:
-                        nxt = copy.deepcopy(current)
-                        obs = nxt.step(click_action, data=data)
-                    except Exception:
-                        continue
-                    new_path = path + [data]
-                    obs_state = _state_name(obs)
-                    if int(getattr(obs, "levels_completed", 0) or 0) > start_levels:
-                        return new_path
-                    if obs_state == "WIN":
-                        return new_path
-                    if obs_state == "NOT_FINISHED":
-                        k = self._click_state_key(nxt)
-                        if k not in seen:
-                            seen.add(k)
-                            queue.append((nxt, new_path))
-        finally:
-            gc.enable()
-
-        return None
-
-    def _local_state_key(self, raw_env) -> tuple:
-        game = getattr(raw_env, "_game", None)
-        if game is None:
-            return (id(raw_env),)
-
-        parts = [getattr(game, "_current_level_index", 0)]
-        level = getattr(game, "current_level", None)
-        if level is not None:
-            for s in getattr(level, "_sprites", []):
-                tags = tuple(sorted(getattr(s, "tags", [])))
-                parts.append((int(getattr(s, "_x", 0)), int(getattr(s, "_y", 0)), tags))
-        else:
-            for v in vars(game).values():
-                if hasattr(v, "pixels") and hasattr(v, "_x") and hasattr(v, "_y"):
-                    tags = tuple(sorted(getattr(v, "tags", [])))
-                    parts.append((int(getattr(v, "_x", 0)), int(getattr(v, "_y", 0)), tags))
-        return tuple(parts)
 
 
 # ---------------------------------------------------------------------------

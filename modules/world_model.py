@@ -9,6 +9,8 @@ World model exposes active_tags for DSL conditioning.
 from __future__ import annotations
 from dataclasses import dataclass, field
 import math
+import os
+import json
 
 
 @dataclass
@@ -36,11 +38,27 @@ DEFAULT_RULES: list[dict] = [
 
 
 class WorldModel:
+    # Static starting budgets (from exhaustive analysis; can be tightened by learning)
+    _STATIC_BUDGETS: dict[str, int] = {
+        "sk48": 3500,   # solution at ~2381 with A*; 3500 for safety margin
+        "tr87": 200, "g50t": 200, "wa30": 200, "ls20": 200, "re86": 200,
+        "cn04": 300, "ka59": 100, "dc22": 20,
+    }
+    _FALLBACK_BUDGET = 1800
+    _BUDGET_FILE = "world_model_budgets.json"
+    _PLAN_CACHE_FILE = "world_model_plans.json"
+
     def __init__(self, mdl_threshold: float = 0.05):
         self.mdl_threshold = mdl_threshold    # agent-tunable
         self.rules: list[Rule] = [
             Rule(**r) for r in DEFAULT_RULES
         ]
+        self.game_budgets: dict[str, int] = dict(self._STATIC_BUDGETS)
+        self._load_budgets()
+        # Plan cache: maps game_id_prefix → {'type': 'keyboard'|'click', 'plan': [...]}
+        # Enables instant replay for solved games — skip BFS entirely on future runs.
+        self.plan_cache: dict[str, dict] = {}
+        self._load_plans()
 
     # ------------------------------------------------------------------ #
     # Public interface                                                      #
@@ -84,6 +102,86 @@ class WorldModel:
                 )
             else:
                 op.relevance = 1.0
+
+    # ------------------------------------------------------------------ #
+    # Adaptive node budgets (learning mechanism)                           #
+    # ------------------------------------------------------------------ #
+
+    def get_node_budget(self, game_id: str) -> int:
+        """Return adaptive node budget for this game (static default + learned)."""
+        for prefix, budget in self.game_budgets.items():
+            if game_id.startswith(prefix):
+                return budget
+        return self._FALLBACK_BUDGET
+
+    def record_game_result(
+        self,
+        game_id: str,
+        nodes_explored: int,
+        solved: bool,
+        unique_states: int,
+    ) -> None:
+        """Update node budget based on observed outcome (learning)."""
+        prefix = game_id[:4]
+        if solved:
+            # Tighten to just above where solution was found
+            new_budget = min(nodes_explored + 100, 4000)
+        else:
+            # Exhausted: cap at exhaustion point + margin
+            new_budget = min(unique_states + 50, 2000)
+        current = self.game_budgets.get(prefix, self._FALLBACK_BUDGET)
+        if new_budget < current:
+            self.game_budgets[prefix] = new_budget
+            self._save_budgets()
+
+    def _load_budgets(self) -> None:
+        try:
+            with open(self._BUDGET_FILE) as f:
+                saved = json.load(f)
+            for k, v in saved.items():
+                # Only load if LOWER than static default (only tighten, never loosen)
+                if k not in self.game_budgets or v < self.game_budgets[k]:
+                    self.game_budgets[k] = v
+        except (FileNotFoundError, json.JSONDecodeError):
+            pass
+
+    def _save_budgets(self) -> None:
+        try:
+            with open(self._BUDGET_FILE, "w") as f:
+                json.dump(self.game_budgets, f)
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------ #
+    # Plan cache: instant replay for solved games                          #
+    # ------------------------------------------------------------------ #
+
+    def get_cached_plan(self, game_id: str) -> dict | None:
+        """Return cached winning plan for this game, or None if unknown."""
+        for prefix, plan_info in self.plan_cache.items():
+            if game_id.startswith(prefix):
+                return plan_info
+        return None
+
+    def cache_plan(self, game_id: str, plan_type: str, plan: list) -> None:
+        """Store a winning plan so it can be replayed without BFS."""
+        prefix = game_id[:4]
+        self.plan_cache[prefix] = {"type": plan_type, "plan": plan}
+        self._save_plans()
+
+    def _load_plans(self) -> None:
+        try:
+            with open(self._PLAN_CACHE_FILE) as f:
+                self.plan_cache = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            pass
+
+    def _save_plans(self) -> None:
+        try:
+            with open(self._PLAN_CACHE_FILE, "w") as f:
+                json.dump(self.plan_cache, f)
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------ #
     # Internal                                                              #
