@@ -84,7 +84,12 @@ class Perception:
     # ------------------------------------------------------------------ #
 
     def local_state_key(self, raw_env) -> tuple:
-        """Position+tag state key for keyboard BFS."""
+        """Position+name+tag state key for keyboard BFS.
+
+        Includes sprite name because some games (e.g. tr87) cycle sprites by
+        replacing them with identically-positioned sprites of different names —
+        position+tags alone would see all configurations as identical.
+        """
         game = getattr(raw_env, "_game", None)
         if game is None:
             return (id(raw_env),)
@@ -94,13 +99,66 @@ class Perception:
         if level is not None:
             for s in getattr(level, "_sprites", []):
                 tags = tuple(sorted(getattr(s, "tags", [])))
-                parts.append((int(getattr(s, "_x", 0)), int(getattr(s, "_y", 0)), tags))
+                parts.append((int(getattr(s, "_x", 0)), int(getattr(s, "_y", 0)),
+                               tags, getattr(s, "name", "")))
         else:
             for v in vars(game).values():
                 if hasattr(v, "pixels") and hasattr(v, "_x") and hasattr(v, "_y"):
                     tags = tuple(sorted(getattr(v, "tags", [])))
-                    parts.append((int(getattr(v, "_x", 0)), int(getattr(v, "_y", 0)), tags))
+                    parts.append((int(getattr(v, "_x", 0)), int(getattr(v, "_y", 0)),
+                                   tags, getattr(v, "name", "")))
         return tuple(parts)
+
+    # ------------------------------------------------------------------ #
+    # LeCun JEPA-inspired compressed state representation                  #
+    # ------------------------------------------------------------------ #
+
+    def filtered_local_state_key(self, raw_env, relevant_indices: list[int]) -> tuple:
+        """State key using only the dynamically relevant sprites (learned encoder).
+
+        Compresses the state representation to the minimal set of sprite indices
+        that actually change during exploration — analogous to JEPA's latent
+        representation that discards irrelevant scene background.
+        """
+        game = getattr(raw_env, "_game", None)
+        if game is None:
+            return (id(raw_env),)
+        parts: list = [getattr(game, "_current_level_index", 0)]
+        level = getattr(game, "current_level", None)
+        sprites = getattr(level, "_sprites", []) if level else []
+        for i in relevant_indices:
+            if i < len(sprites):
+                s = sprites[i]
+                tags = tuple(sorted(getattr(s, "tags", [])))
+                parts.append((int(getattr(s, "_x", 0)), int(getattr(s, "_y", 0)),
+                               tags, getattr(s, "name", "")))
+        return tuple(parts)
+
+    @staticmethod
+    def infer_relevant_sprites(observed_keys: list[tuple]) -> list[int]:
+        """From a list of observed BFS state keys, find which sprite indices vary.
+
+        The world model LEARNS which dimensions of the state key are informative
+        by observing which ones change across transitions — self-supervised
+        representation learning from the game's own dynamics.
+        Returns sorted list of sprite indices (0-based into level._sprites).
+        """
+        if len(observed_keys) < 2:
+            return []
+        # Each key = (level_index, sprite_0_tuple, sprite_1_tuple, ...)
+        n_sprites = max((len(k) - 1 for k in observed_keys), default=0)
+        if n_sprites == 0:
+            return []
+        relevant = []
+        for i in range(n_sprites):
+            pos = i + 1  # position in key tuple
+            vals: set = set()
+            for k in observed_keys:
+                if pos < len(k):
+                    vals.add(k[pos])
+            if len(vals) > 1:
+                relevant.append(i)
+        return relevant
 
     def click_state_key(self, raw_env) -> tuple:
         """Pixel-hash state key for click BFS."""

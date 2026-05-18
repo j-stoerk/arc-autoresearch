@@ -48,6 +48,9 @@ class WorldModel:
     _BUDGET_FILE = "world_model_budgets.json"
     _PLAN_CACHE_FILE = "world_model_plans.json"
     _EXHAUSTED_FILE = "world_model_exhausted.json"
+    # LeCun-inspired: learned encoder abstractions (relevant sprite indices per game).
+    # Keys = 4-char game prefix; values = list[int] of sprite indices that change state.
+    _ABSTRACTIONS_FILE = "world_model_abstractions.json"
 
     def __init__(self, mdl_threshold: float = 0.05):
         self.mdl_threshold = mdl_threshold    # agent-tunable
@@ -64,6 +67,10 @@ class WorldModel:
         # Stored as 4-char prefix set; checked before running click BFS to skip instantly.
         self.exhausted_click_games: set[str] = set()
         self._load_exhausted()
+        # Maps game_id_prefix → list of sprite indices that vary during BFS exploration.
+        # Learned online; used to build compressed state keys for efficient planning.
+        self.sprite_abstractions: dict[str, list[int]] = {}
+        self._load_abstractions()
 
     # ------------------------------------------------------------------ #
     # Public interface                                                      #
@@ -216,6 +223,40 @@ class WorldModel:
         try:
             with open(self._EXHAUSTED_FILE, "w") as f:
                 json.dump(sorted(self.exhausted_click_games), f)
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------ #
+    # Learned state abstraction (LeCun JEPA-inspired encoder)              #
+    # The world model learns which sprite indices are dynamically relevant  #
+    # by observing which ones change during BFS exploration.                #
+    # Compressed keys eliminate redundant background-sprite dimensions,    #
+    # dramatically shrinking the effective search space.                    #
+    # ------------------------------------------------------------------ #
+
+    def get_sprite_abstraction(self, game_id: str) -> list[int] | None:
+        """Return cached relevant sprite indices for this game, or None if unknown."""
+        return self.sprite_abstractions.get(game_id[:4])
+
+    def cache_sprite_abstraction(self, game_id: str, indices: list[int]) -> None:
+        """Store learned relevant-sprite indices for this game."""
+        prefix = game_id[:4]
+        if prefix not in self.sprite_abstractions:
+            self.sprite_abstractions[prefix] = indices
+            self._save_abstractions()
+
+    def _load_abstractions(self) -> None:
+        try:
+            with open(self._ABSTRACTIONS_FILE) as f:
+                saved = json.load(f)
+            self.sprite_abstractions = {k: v for k, v in saved.items()}
+        except (FileNotFoundError, json.JSONDecodeError):
+            pass
+
+    def _save_abstractions(self) -> None:
+        try:
+            with open(self._ABSTRACTIONS_FILE, "w") as f:
+                json.dump(self.sprite_abstractions, f)
         except Exception:
             pass
 

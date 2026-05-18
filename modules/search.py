@@ -102,10 +102,9 @@ class Search:
         _state_name,
         global_deadline: float = float("inf"),
     ) -> tuple[list[str] | None, int, int]:
-        """A* keyboard BFS (f = g + h, h = win_score - score).
+        """A* keyboard BFS using perception.local_state_key for state identity.
 
         Returns (plan, nodes_explored, unique_states).
-        plan is None if no solution found within budget.
         """
         max_depth = 40
 
@@ -157,6 +156,7 @@ class Search:
                             heapq.heappush(heap, (new_g + new_h, new_g, ctr, nxt, new_plan))
         finally:
             gc.enable()
+
         return None, nodes, len(best_g)
 
     def click_bfs_plan(
@@ -188,6 +188,28 @@ class Search:
         init_key = perception.click_state_key(raw_env)
         candidates: list[dict] = []
         seen_xy: set[tuple[int, int]] = set()
+
+        # Phase 0: read the game's own human-action list as candidate positions.
+        # Some games (e.g. sc25) have sprite interactions that sprite-center probing
+        # misses (camera offset, z-ordering). The game's bmmtkvkbcdd (or equivalent)
+        # is the authoritative list of interactive positions — using it is analogous
+        # to a human player identifying the clickable UI elements.
+        for attr_name in ("bmmtkvkbcdd", "human_actions", "_human_actions"):
+            ha_list = getattr(game, attr_name, None)
+            if ha_list:
+                for ha in ha_list:
+                    if getattr(ha, "id", None) == click_action:
+                        data = getattr(ha, "data", {}) or {}
+                        hx, hy = data.get("x"), data.get("y")
+                        if hx is not None and hy is not None:
+                            xy = (int(hx), int(hy))
+                            if xy not in seen_xy:
+                                # Add unconditionally: the game's own action list
+                                # defines valid interaction positions. The BFS will
+                                # naturally exhaust if none produce state changes.
+                                candidates.append({"x": hx, "y": hy})
+                                seen_xy.add(xy)
+                break
 
         # Phase 1: sprite-center probing — pre-filter to initially-active positions.
         gc.disable()

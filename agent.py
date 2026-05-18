@@ -373,8 +373,9 @@ class Agent:
         # Phase 1: keyboard A* BFS — budget determined by WorldModel (adaptive + learned)
         plan_nodes = self.world.get_node_budget(game_id)
 
-        plan, nodes_explored, unique_states = self.search.local_bfs_plan(  # noqa: E501
-            raw_env, simple_actions, start_levels, plan_nodes, self.perception, _state_name
+        plan, nodes_explored, unique_states = self.search.local_bfs_plan(
+            raw_env, simple_actions, start_levels, plan_nodes,
+            self.perception, _state_name,
         )
         self.world.record_game_result(game_id, nodes_explored, plan is not None, unique_states)
 
