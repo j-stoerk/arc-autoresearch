@@ -327,9 +327,14 @@ class Agent:
                 for a in actions
             )
             if has_complex:
-                click_plan = self.search.click_bfs_plan(
-                    raw_env, start_levels, self.perception, _state_name
-                )
+                if self.world.is_click_exhausted(game_id):
+                    click_plan = None
+                else:
+                    click_plan = self.search.click_bfs_plan(
+                        raw_env, start_levels, self.perception, _state_name,
+                        on_phase2b_exhausted=self.world.mark_click_exhausted,
+                        game_id=game_id,
+                    )
                 if click_plan is not None:
                     try:
                         from arcengine.enums import GameAction as _GameAction
@@ -374,7 +379,53 @@ class Agent:
         self.world.record_game_result(game_id, nodes_explored, plan is not None, unique_states)
 
         if plan is None:
-            # BFS found nothing: feed effective-action observations into WorldModel so
+            # Keyboard BFS found nothing. For mixed games (keyboard + click), also try
+            # click BFS — some games have keyboard actions that change no state but
+            # require ACTION6 clicks to progress (e.g. sc25, dc22, ka59).
+            has_complex = any(
+                callable(getattr(a, "is_complex", None)) and a.is_complex()
+                for a in actions
+            )
+            if has_complex and not self.world.is_click_exhausted(game_id):
+                click_plan = self.search.click_bfs_plan(
+                    raw_env, start_levels, self.perception, _state_name,
+                    on_phase2b_exhausted=self.world.mark_click_exhausted,
+                    game_id=game_id,
+                )
+                if click_plan is not None:
+                    try:
+                        from arcengine.enums import GameAction as _GameAction
+                        click_action = _GameAction.ACTION6
+                    except ImportError:
+                        click_action = None
+                    goal_reached = False
+                    if click_action is not None:
+                        for data in click_plan:
+                            if time.monotonic() - t_start > TIME_BUDGET:
+                                break
+                            if self.loop.budget_exhausted(env.actions_taken, env.action_budget):
+                                break
+                            obs = raw_env.step(click_action, data=data)
+                            env.actions_taken += 1
+                            env.last_obs = obs
+                            if int(getattr(obs, "levels_completed", 0) or 0) > start_levels:
+                                goal_reached = True
+                                break
+                            if _state_name(obs) == "WIN":
+                                goal_reached = True
+                                break
+                    if goal_reached:
+                        self.world.cache_plan(game_id, "click", click_plan)
+                    ep = Episode(
+                        task_id=spec.task_id,
+                        trajectory=[],
+                        outcome=goal_reached,
+                        rhae=0.0,
+                        fingerprint=state.grid.flatten().astype(float),
+                    )
+                    self.memory.store(ep)
+                    return EpisodeResult(spec.task_id, env.actions_taken, goal_reached, 0.0)
+            # Feed effective-action observations into WorldModel so
             # the beam-search fallback focuses on actions that actually change state.
             self.search.update_dsl_from_bfs(raw_env, simple_actions, self.perception)
             return None
@@ -393,6 +444,9 @@ class Agent:
             env.actions_taken += 1
             env.last_obs = obs
             if int(getattr(obs, "levels_completed", 0) or 0) > start_levels:
+                goal_reached = True
+                break
+            if _state_name(obs) == "WIN":
                 goal_reached = True
                 break
 

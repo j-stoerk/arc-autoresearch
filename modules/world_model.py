@@ -47,6 +47,7 @@ class WorldModel:
     _FALLBACK_BUDGET = 1800
     _BUDGET_FILE = "world_model_budgets.json"
     _PLAN_CACHE_FILE = "world_model_plans.json"
+    _EXHAUSTED_FILE = "world_model_exhausted.json"
 
     def __init__(self, mdl_threshold: float = 0.05):
         self.mdl_threshold = mdl_threshold    # agent-tunable
@@ -59,6 +60,10 @@ class WorldModel:
         # Enables instant replay for solved games — skip BFS entirely on future runs.
         self.plan_cache: dict[str, dict] = {}
         self._load_plans()
+        # Games where click BFS (including Phase 2b) fully exhausted the state space.
+        # Stored as 4-char prefix set; checked before running click BFS to skip instantly.
+        self.exhausted_click_games: set[str] = set()
+        self._load_exhausted()
 
     # ------------------------------------------------------------------ #
     # Public interface                                                      #
@@ -180,6 +185,37 @@ class WorldModel:
         try:
             with open(self._PLAN_CACHE_FILE, "w") as f:
                 json.dump(self.plan_cache, f)
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------ #
+    # Exhausted click games: skip BFS for games with no reachable solution #
+    # ------------------------------------------------------------------ #
+
+    def is_click_exhausted(self, game_id: str) -> bool:
+        """True if click BFS + Phase 2b already exhausted for this game."""
+        prefix = game_id[:4]
+        return prefix in self.exhausted_click_games
+
+    def mark_click_exhausted(self, game_id: str) -> None:
+        """Record that Phase 2b exhausted the full state space — never try again."""
+        prefix = game_id[:4]
+        if prefix not in self.exhausted_click_games:
+            self.exhausted_click_games.add(prefix)
+            self._save_exhausted()
+
+    def _load_exhausted(self) -> None:
+        try:
+            with open(self._EXHAUSTED_FILE) as f:
+                data = json.load(f)
+            self.exhausted_click_games = set(data)
+        except (FileNotFoundError, json.JSONDecodeError):
+            pass
+
+    def _save_exhausted(self) -> None:
+        try:
+            with open(self._EXHAUSTED_FILE, "w") as f:
+                json.dump(sorted(self.exhausted_click_games), f)
         except Exception:
             pass
 
