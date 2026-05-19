@@ -46,6 +46,7 @@ from modules.action        import ActionExecutor
 from modules.memory        import Memory, Episode
 from modules.world_model   import WorldModel
 from modules.loop          import LoopController
+from modules.mechanics     import MechanicsLearner
 
 # ---------------------------------------------------------------------------
 # Hyperparameters (agent modifies these)
@@ -103,6 +104,7 @@ class Agent:
             max_replans=MAX_REPLANS,
             stall_threshold=STALL_THRESHOLD,
         )
+        self.mechanics  = MechanicsLearner(self.perception, _state_name)
 
         # Seed hypotheses
         self.hyp_set.seed(SEED_HYPOTHESES)
@@ -378,6 +380,44 @@ class Agent:
             self.perception, _state_name,
         )
         self.world.record_game_result(game_id, nodes_explored, plan is not None, unique_states)
+
+        if plan is None:
+            # BFS found no plan. Try MechanicsLearner: detects cycle semantics from
+            # observed transitions and builds a direct plan in O(N) — returns None
+            # immediately for games without cycle structure (cheap probe).
+            mech_plan = self.mechanics.learn_and_plan(
+                raw_env, simple_actions, start_levels,
+                node_budget=max(50, plan_nodes),
+                global_deadline=self._eval_start + TIME_BUDGET - 10,
+            )
+            if mech_plan is not None:
+                by_name = {getattr(a, "name", ""): a for a in actions}
+                goal_reached = False
+                for name in mech_plan:
+                    if time.monotonic() - t_start > TIME_BUDGET:
+                        break
+                    if self.loop.budget_exhausted(env.actions_taken, env.action_budget):
+                        break
+                    action = by_name.get(name)
+                    if action is None:
+                        break
+                    obs = raw_env.step(action)
+                    env.actions_taken += 1
+                    env.last_obs = obs
+                    if int(getattr(obs, "levels_completed", 0) or 0) > start_levels:
+                        goal_reached = True
+                        break
+                    if _state_name(obs) == "WIN":
+                        goal_reached = True
+                        break
+                if goal_reached:
+                    self.world.cache_plan(game_id, "keyboard", mech_plan)
+                ep = Episode(
+                    task_id=spec.task_id, trajectory=[], outcome=goal_reached,
+                    rhae=0.0, fingerprint=state.grid.flatten().astype(float),
+                )
+                self.memory.store(ep)
+                return EpisodeResult(spec.task_id, env.actions_taken, goal_reached, 0.0)
 
         if plan is None:
             # Keyboard BFS found nothing. For mixed games (keyboard + click), also try
