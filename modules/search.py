@@ -159,6 +159,75 @@ class Search:
 
         return None, nodes, len(best_g)
 
+    def full_key_bfs_plan(
+        self,
+        raw_env,
+        actions,
+        start_levels: int,
+        node_budget: int,
+        perception,
+        _state_name,
+        global_deadline: float = float("inf"),
+    ) -> tuple[list[str] | None, int, int]:
+        """A* BFS using perception.full_state_key (position + pixel hash).
+
+        Handles games where actions change pixel content without moving sprites
+        (e.g. selection cycling with ACTION5), which local_state_key misses.
+        Returns (plan, nodes_explored, unique_states).
+        """
+        max_depth = 40
+
+        def _game_score(env):
+            g = getattr(env, "_game", None)
+            return int(getattr(g, "_score", 0) or 0) if g else 0
+
+        def _win_score(env):
+            g = getattr(env, "_game", None)
+            return int(getattr(g, "_win_score", 1000) or 1000) if g else 1000
+
+        ws = _win_score(raw_env)
+        ctr = 0
+        h0 = ws - _game_score(raw_env)
+        heap = [(h0, 0, ctr, copy.deepcopy(raw_env), [])]
+        best_g: dict = {}
+        nodes = 0
+
+        gc.disable()
+        try:
+            while heap and nodes < node_budget and time.monotonic() < global_deadline:
+                f, g, _, current, plan = heapq.heappop(heap)
+                nodes += 1
+                key = perception.full_state_key(current)
+                if key in best_g and best_g[key] <= g:
+                    continue
+                best_g[key] = g
+                if len(plan) >= max_depth:
+                    continue
+
+                for action in actions:
+                    try:
+                        nxt = copy.deepcopy(current)
+                        obs = nxt.step(action)
+                    except Exception:
+                        continue
+                    new_plan = plan + [getattr(action, "name", str(action))]
+                    obs_state = _state_name(obs)
+                    if int(getattr(obs, "levels_completed", 0) or 0) > start_levels:
+                        return new_plan, nodes, len(best_g)
+                    if obs_state == "WIN":
+                        return new_plan, nodes, len(best_g)
+                    if obs_state == "NOT_FINISHED":
+                        new_g = g + 1
+                        new_key = perception.full_state_key(nxt)
+                        if new_key not in best_g or best_g[new_key] > new_g:
+                            new_h = ws - _game_score(nxt)
+                            ctr += 1
+                            heapq.heappush(heap, (new_g + new_h, new_g, ctr, nxt, new_plan))
+        finally:
+            gc.enable()
+
+        return None, nodes, len(best_g)
+
     def click_bfs_plan(
         self,
         raw_env,

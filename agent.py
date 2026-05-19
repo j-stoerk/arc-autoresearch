@@ -390,6 +390,38 @@ class Agent:
                 node_budget=max(50, plan_nodes),
                 global_deadline=self._eval_start + TIME_BUDGET - 10,
             )
+            if mech_plan is None and unique_states < max(50, plan_nodes):
+                # Position-key BFS exhausted a small state space AND mechanics
+                # learner found nothing. This often means a pixel-only state change
+                # (e.g. ACTION5 cycling selection) is not captured by local_state_key.
+                # Check: does any action change pixels without changing position?
+                # Only then retry with full_state_key (position + pixel hash).
+                from modules.mechanics import _pix_key as _mech_pix_key
+                import copy as _copy
+                _k0 = self.perception.local_state_key(raw_env)
+                _ph0 = _mech_pix_key(raw_env)
+                _has_pix_cycle = False
+                for _act in simple_actions:
+                    _probe = _copy.deepcopy(raw_env)
+                    _probe.step(_act)
+                    if (self.perception.local_state_key(_probe) == _k0
+                            and _mech_pix_key(_probe) != _ph0):
+                        _has_pix_cycle = True
+                        break
+                if _has_pix_cycle:
+                    full_key_deadline = min(
+                        self._eval_start + TIME_BUDGET - 10,
+                        time.monotonic() + 15.0,
+                    )
+                    mech_plan_list, _, _ = self.search.full_key_bfs_plan(
+                        raw_env, simple_actions, start_levels,
+                        node_budget=min(plan_nodes * 4, 800),
+                        perception=self.perception,
+                        _state_name=_state_name,
+                        global_deadline=full_key_deadline,
+                    )
+                    mech_plan = mech_plan_list
+
             if mech_plan is not None:
                 by_name = {getattr(a, "name", ""): a for a in actions}
                 goal_reached = False

@@ -102,6 +102,25 @@ class Perception:
                     parts.append((int(getattr(v, "_x", 0)), int(getattr(v, "_y", 0)), tags))
         return tuple(parts)
 
+    def full_state_key(self, raw_env) -> tuple:
+        """Position + pixel-hash state key — captures both movement and pixel-only changes.
+
+        Used for games where an action changes pixel content without moving sprites
+        (e.g. selection cycling), which local_state_key misses.
+        """
+        import numpy as np
+        game = getattr(raw_env, "_game", None)
+        if game is None:
+            return (id(raw_env),)
+        parts = [getattr(game, "_current_level_index", 0)]
+        level = getattr(game, "current_level", None)
+        if level is not None:
+            for s in getattr(level, "_sprites", []):
+                px = getattr(s, "pixels", None)
+                ph = hash(np.asarray(px, dtype=np.int32).tobytes()) if px is not None else 0
+                parts.append((int(getattr(s, "_x", 0)), int(getattr(s, "_y", 0)), ph))
+        return tuple(parts)
+
     # ------------------------------------------------------------------ #
     # LeCun JEPA-inspired compressed state representation                  #
     # ------------------------------------------------------------------ #
