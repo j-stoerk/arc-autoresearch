@@ -53,6 +53,8 @@ class MechanicsLearner:
     def __init__(self, perception, state_name_fn):
         self.perception = perception
         self._state_name = state_name_fn
+        # Track games where internal_state_bfs found nothing (persist across episodes)
+        self._isb_exhausted: set[str] = set()
 
     # ------------------------------------------------------------------ #
 
@@ -74,7 +76,16 @@ class MechanicsLearner:
         if plan is not None:
             return plan
 
-        # Secondary path: direct solver for delivery games (wa30 style)
+        # Secondary path: BFS with internal game state variables (ls20 style)
+        game_prefix = (getattr(getattr(raw_env, "_game", None), "_game_id", "") or "")[:4]
+        if game_prefix not in self._isb_exhausted:
+            plan = self._internal_state_bfs(raw_env, actions, start_levels, node_budget, global_deadline)
+            if plan is not None:
+                return plan
+            else:
+                self._isb_exhausted.add(game_prefix)  # don't try again
+
+        # Tertiary path: direct solver for delivery games (wa30 style)
         plan = self._delivery_solver(raw_env, actions, start_levels, global_deadline)
         if plan is not None:
             return plan
@@ -246,6 +257,181 @@ class MechanicsLearner:
             plan = _build_plan_for_direction(fwd_cyc, bck_cyc)
             if plan is not None and _validate_plan(plan):
                 return plan
+        return None
+
+    # ------------------------------------------------------------------ #
+    # Internal-state BFS (ls20 style)                                     #
+    # ------------------------------------------------------------------ #
+
+    def _internal_state_bfs(
+        self, raw_env, actions, start_levels, node_budget, global_deadline,
+        max_nodes: int = 2000,  # internal cap; overrides node_budget when larger
+    ) -> list[str] | None:
+        """BFS that discovers internal game state variables (not reflected in sprite
+        positions) and includes them in the state key.
+
+        Games like ls20 have internal variables (shape, color, rotation) that affect
+        the win condition but don't change sprite pixel hashes. This solver discovers
+        those variables by comparing all simple (int/bool/float) game attributes before
+        and after each action, then runs BFS with an enriched key.
+        """
+        import time
+        import heapq
+
+        if time.monotonic() >= global_deadline:
+            return None
+
+        action_map = {getattr(a, "name", ""): a for a in actions}
+        game = getattr(raw_env, "_game", None)
+        if game is None:
+            return None
+
+        # Snapshot all simple game attributes at initial state
+        def _snap(env):
+            g = getattr(env, "_game", None)
+            if g is None:
+                return {}
+            snap = {}
+            for k, v in vars(g).items():
+                if isinstance(v, (int, float, bool)):
+                    snap[k] = v
+            return snap
+
+        snap0 = _snap(raw_env)
+        if not snap0:
+            return None
+
+        # Discover which attributes change: first probe single steps, then run a short
+        # local-state-key BFS (≤50 nodes) to find changes at special positions.
+        changed_attrs: set[str] = set()
+
+        # Phase 1: single-step probes from initial state
+        for nm, act in action_map.items():
+            probe = copy.deepcopy(raw_env)
+            gc.disable()
+            try:
+                probe.step(act)
+            finally:
+                gc.enable()
+            snap1 = _snap(probe)
+            for k in snap0:
+                if k in snap1 and snap1[k] != snap0[k]:
+                    changed_attrs.add(k)
+
+        # Phase 2: short BFS with local_state_key to find changes at special positions
+        from collections import deque as _deque
+        init_lsk = self.perception.local_state_key(raw_env)
+        mini_queue = _deque([(copy.deepcopy(raw_env), 0)])
+        mini_seen = {init_lsk}
+        mini_nodes = 0
+        mini_deadline = time.monotonic() + 5.0  # hard 5s cap for discovery
+        gc.disable()
+        try:
+            while mini_queue and mini_nodes < 60 and time.monotonic() < mini_deadline:
+                cur_env, depth = mini_queue.popleft()
+                mini_nodes += 1
+                cur_snap = _snap(cur_env)
+                for k in snap0:
+                    if k in cur_snap and cur_snap[k] != snap0[k]:
+                        changed_attrs.add(k)
+                if depth < 15:
+                    for act in actions:
+                        if time.monotonic() >= mini_deadline:
+                            break
+                        try:
+                            nxt = copy.deepcopy(cur_env)
+                            nxt.step(act)
+                        except Exception:
+                            continue
+                        nk = self.perception.local_state_key(nxt)
+                        if nk not in mini_seen:
+                            mini_seen.add(nk)
+                            mini_queue.append((nxt, depth + 1))
+        finally:
+            gc.enable()
+
+        # Only proceed if internal variables changed (not just player position)
+        # Filter: small value range, non-private, not step counters
+        relevant_attrs: list[str] = sorted(
+            k for k in changed_attrs
+            if not k.startswith('_') and abs(snap0.get(k, 0)) < 1000
+        )
+        if not relevant_attrs:
+            return None  # No meaningful internal state changes detected
+
+        # Define enriched state key: local_state_key + changed_attrs values
+        def _enriched_key(env):
+            base = self.perception.local_state_key(env)
+            g = getattr(env, "_game", None)
+            extras = tuple(getattr(g, k, None) for k in sorted(changed_attrs))
+            return (base, extras)
+
+        # Also try player's direct position (using gudziatsk if available)
+        def _player_pos(env):
+            g = getattr(env, "_game", None)
+            gd = getattr(g, "gudziatsk", None)
+            if gd:
+                return (getattr(gd, "x", None), getattr(gd, "y", None))
+            return self.perception.local_state_key(env)
+
+        def _fast_key(env):
+            g = getattr(env, "_game", None)
+            gd = getattr(g, "gudziatsk", None)
+            if gd is not None:
+                player_pos = (getattr(gd, "x", None), getattr(gd, "y", None))
+            else:
+                player_pos = self.perception.local_state_key(env)
+            extras = tuple(getattr(g, k, None) for k in relevant_attrs)
+            return (player_pos, extras)
+
+        def _game_score(env):
+            g = getattr(env, "_game", None)
+            return int(getattr(g, "_score", 0) or 0) if g else 0
+
+        ws = int(getattr(game, "_win_score", 1000) or 1000)
+        h0 = ws - _game_score(raw_env)
+        ctr = 0
+        heap = [(h0, 0, ctr, copy.deepcopy(raw_env), [])]
+        best_g: dict = {}
+        nodes = 0
+        effective_budget = max(node_budget, max_nodes)
+        # Cap time to avoid consuming too much budget on a single game
+        time_cap = min(global_deadline, time.monotonic() + 15.0)
+
+        gc.disable()
+        try:
+            while heap and nodes < effective_budget and time.monotonic() < time_cap:
+                f, g, _, current, plan = heapq.heappop(heap)
+                nodes += 1
+                key = _fast_key(current)
+                if key in best_g and best_g[key] <= g:
+                    continue
+                best_g[key] = g
+                if len(plan) >= 60:
+                    continue
+
+                for act in actions:
+                    try:
+                        nxt = copy.deepcopy(current)
+                        obs = nxt.step(act)
+                    except Exception:
+                        continue
+                    new_plan = plan + [getattr(act, "name", str(act))]
+                    obs_state = self._state_name(obs)
+                    if int(getattr(obs, "levels_completed", 0) or 0) > start_levels:
+                        return new_plan
+                    if obs_state == "WIN":
+                        return new_plan
+                    if obs_state == "NOT_FINISHED":
+                        new_g = g + 1
+                        new_key = _fast_key(nxt)
+                        if new_key not in best_g or best_g[new_key] > new_g:
+                            new_h = ws - _game_score(nxt)
+                            ctr += 1
+                            heapq.heappush(heap, (new_g + new_h, new_g, ctr, nxt, new_plan))
+        finally:
+            gc.enable()
+
         return None
 
     # ------------------------------------------------------------------ #

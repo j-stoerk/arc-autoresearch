@@ -71,6 +71,10 @@ class WorldModel:
         # Learned online; used to build compressed state keys for efficient planning.
         self.sprite_abstractions: dict[str, list[int]] = {}
         self._load_abstractions()
+        # Games where internal-state BFS found nothing (not solvable via that approach).
+        # Prevents re-running expensive internal_state_bfs on known-dead games.
+        self.exhausted_isb_games: set[str] = set()
+        self._load_isb_exhausted()
 
     # ------------------------------------------------------------------ #
     # Public interface                                                      #
@@ -223,6 +227,34 @@ class WorldModel:
         try:
             with open(self._EXHAUSTED_FILE, "w") as f:
                 json.dump(sorted(self.exhausted_click_games), f)
+        except Exception:
+            pass
+
+    def is_isb_exhausted(self, game_id: str) -> bool:
+        """True if internal-state BFS already failed for this game."""
+        return game_id[:4] in self.exhausted_isb_games
+
+    def mark_isb_exhausted(self, game_id: str) -> None:
+        """Record that internal-state BFS found nothing — skip on future runs."""
+        prefix = game_id[:4]
+        if prefix not in self.exhausted_isb_games:
+            self.exhausted_isb_games.add(prefix)
+            self._save_isb_exhausted()
+
+    _ISB_EXHAUSTED_FILE = "world_model_isb_exhausted.json"
+
+    def _load_isb_exhausted(self) -> None:
+        try:
+            with open(self._ISB_EXHAUSTED_FILE) as f:
+                data = json.load(f)
+            self.exhausted_isb_games = set(data)
+        except (FileNotFoundError, json.JSONDecodeError):
+            pass
+
+    def _save_isb_exhausted(self) -> None:
+        try:
+            with open(self._ISB_EXHAUSTED_FILE, "w") as f:
+                json.dump(sorted(self.exhausted_isb_games), f)
         except Exception:
             pass
 

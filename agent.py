@@ -385,11 +385,20 @@ class Agent:
             # BFS found no plan. Try MechanicsLearner: detects cycle semantics from
             # observed transitions and builds a direct plan in O(N) — returns None
             # immediately for games without cycle structure (cheap probe).
+            # Skip internal_state_bfs for games already known to find nothing.
+            if not self.world.is_isb_exhausted(game_id):
+                # Temporarily inject exhaustion status into the learner
+                self.mechanics._isb_exhausted = set()  # clear per-game (WorldModel tracks persistence)
+            else:
+                self.mechanics._isb_exhausted = {game_id[:4]}  # pre-mark as exhausted
             mech_plan = self.mechanics.learn_and_plan(
                 raw_env, simple_actions, start_levels,
                 node_budget=max(50, plan_nodes),
                 global_deadline=self._eval_start + TIME_BUDGET - 10,
             )
+            # If internal_state_bfs ran and found nothing, persist the exhaustion
+            if game_id[:4] in self.mechanics._isb_exhausted and not self.world.is_isb_exhausted(game_id):
+                self.world.mark_isb_exhausted(game_id)
             # Note: relevant_full_key_bfs_plan is available in search module for
             # future use when games with hidden carry-state are identified.
 
