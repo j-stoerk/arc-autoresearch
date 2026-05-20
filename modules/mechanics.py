@@ -65,14 +65,28 @@ class MechanicsLearner:
         start_levels: int,
         node_budget: int,
         global_deadline: float = float("inf"),
+        all_actions=None,
     ) -> list[str] | None:
-        """Try to compute a plan by learning game mechanics. Returns action names or None."""
+        """Try to compute a plan by learning game mechanics. Returns action names or None.
+
+        actions: keyboard-only (non-complex) actions for BFS-based solvers.
+        all_actions: full action list including complex (ACTION6) actions.
+                     Used by solvers that need click capabilities (e.g. spell casting).
+        """
         import time
         if time.monotonic() >= global_deadline:
             return None
 
         # Primary path: direct solver for cursor+cycle games (tr87 style)
         plan = self._direct_cycle_solver(raw_env, actions, start_levels, global_deadline)
+        if plan is not None:
+            return plan
+
+        # Quaternary path: direct solver for spell-casting games (sc25 style).
+        # Run BEFORE ISB so we short-circuit for games already ISB-exhausted.
+        # Uses full action list (needs ACTION6). Returns list[dict] click plan.
+        _full = all_actions if all_actions is not None else actions
+        plan = self._spell_casting_solver(raw_env, _full, start_levels, global_deadline)
         if plan is not None:
             return plan
 
@@ -1485,3 +1499,179 @@ class MechanicsLearner:
                         plan = _build(best)
                         return plan if plan else None
         return None
+
+    # ------------------------------------------------------------------ #
+    # Spell-casting direct solver (sc25 style)                             #
+    # ------------------------------------------------------------------ #
+
+    def _spell_casting_solver(
+        self, raw_env, actions, start_levels, global_deadline,
+    ) -> list[dict] | None:
+        """Direct solver for games with a spell-casting mechanic:
+        - zzpoabuniyn: dict mapping spell_name → 3×3 boolean pattern
+        - ijhfdcamokt: current spell name (or None if need to select spell)
+        - qytejzcythm: True when a demo animation should be triggered first
+        - 3×3 grid of clickable cells (from bmmtkvkbcdd ACTION6 entries)
+        - Spell-selection buttons (sprites with "sptivk" tag)
+
+        Returns a list[dict] click plan (not list[str] keyboard plan).
+        Agent.py detects the dict type and executes via ACTION6.
+        """
+        import time
+
+        if time.monotonic() >= global_deadline:
+            return None
+
+        game = getattr(raw_env, "_game", None)
+        if game is None:
+            return None
+
+        # Detection guard: must have the spell-pattern dict
+        zzpoabuniyn = getattr(game, "zzpoabuniyn", None)
+        if not zzpoabuniyn or not isinstance(zzpoabuniyn, dict):
+            return None
+
+        action_map = {getattr(a, "name", ""): a for a in actions}
+        action6 = action_map.get("ACTION6")
+        if action6 is None:
+            return None
+
+        ws = int(getattr(game, "_win_score", 6) or 6)
+
+        # ── Gather the 9 grid click positions from bmmtkvkbcdd ──────── #
+        try:
+            from arcengine.enums import GameAction as _GameAction
+            click_enum = _GameAction.ACTION6
+        except ImportError:
+            return None
+
+        grid_positions: list[dict] = []
+        for attr_name in ("bmmtkvkbcdd", "human_actions", "_human_actions"):
+            ha_list = getattr(game, attr_name, None)
+            if not ha_list:
+                continue
+            for ha in ha_list:
+                if getattr(ha, "id", None) == click_enum:
+                    data = getattr(ha, "data", {}) or {}
+                    hx, hy = data.get("x"), data.get("y")
+                    if hx is not None and hy is not None:
+                        grid_positions.append({"x": int(hx), "y": int(hy)})
+            if grid_positions:
+                break
+
+        if len(grid_positions) < 9:
+            return None
+
+        # Sort row-major (y first, then x): top-left → bottom-right
+        grid_positions.sort(key=lambda p: (p["y"], p["x"]))
+
+        # ── Simulation: build plan by replaying game state ──────────── #
+        sim = copy.deepcopy(raw_env)
+        plan: list[dict] = []
+        gc.disable()
+        try:
+            for _step in range(ws * 15):  # generous upper bound
+                if time.monotonic() >= global_deadline:
+                    break
+
+                sg = getattr(sim, "_game", None)
+                if sg is None:
+                    break
+
+                score = int(getattr(sg, "_score", 0) or 0)
+                if score >= ws:
+                    break
+
+                demo_mode = bool(getattr(sg, "qytejzcythm", False))
+                current_spell = getattr(sg, "ijhfdcamokt", None)
+
+                # ── Spell selection ─────────────────────────────────── #
+                if current_spell is None:
+                    # Probe each non-grid sprite with "sptivk" tag to find spell buttons
+                    sl = getattr(sg, "current_level", None)
+                    if sl is None:
+                        break
+                    # Detect scale once
+                    scale = 2
+                    try:
+                        cam = getattr(sg, "camera", None)
+                        if cam is not None:
+                            result = cam.display_to_grid(4, 4)
+                            if result and result[0] > 0:
+                                scale = 4 // result[0]
+                    except Exception:
+                        pass
+
+                    found_button = False
+                    for s in getattr(sl, "_sprites", []):
+                        tags_list = list(getattr(s, "tags", []))
+                        tag_str = " ".join(str(t) for t in tags_list)
+                        if "sptivk" not in tag_str:
+                            continue
+                        # Skip pure-grid-cell sprites
+                        if "clzbxlm" in tag_str:
+                            continue
+                        sx = (int(getattr(s, "_x", 0)) + 1) * scale
+                        sy = (int(getattr(s, "_y", 0)) + 1) * scale
+                        click_data = {"x": sx, "y": sy}
+                        # Probe: does clicking this sprite set ijhfdcamokt?
+                        probe = copy.deepcopy(sim)
+                        try:
+                            probe.step(click_enum, data=click_data)
+                        except Exception:
+                            continue
+                        pg = getattr(probe, "_game", None)
+                        new_spell = getattr(pg, "ijhfdcamokt", None) if pg else None
+                        if new_spell is not None and new_spell in zzpoabuniyn:
+                            obs = sim.step(click_enum, data=click_data)
+                            plan.append(click_data)
+                            lc = int(getattr(obs, "levels_completed", 0) or 0)
+                            if lc > start_levels or self._state_name(obs) == "WIN":
+                                return plan
+                            found_button = True
+                            break
+                    if not found_button:
+                        break
+                    continue
+
+                # ── Demo trigger ─────────────────────────────────────── #
+                if demo_mode:
+                    # One click on any grid cell triggers the demo animation
+                    demo_click = grid_positions[0]
+                    obs = sim.step(click_enum, data=demo_click)
+                    plan.append(demo_click)
+                    lc = int(getattr(obs, "levels_completed", 0) or 0)
+                    if lc > start_levels or self._state_name(obs) == "WIN":
+                        return plan
+                    continue
+
+                # ── Cast current spell ───────────────────────────────── #
+                pattern = zzpoabuniyn.get(current_spell)
+                if pattern is None:
+                    break
+                try:
+                    rows = list(pattern)
+                except Exception:
+                    break
+                if len(rows) != 3:
+                    break
+
+                for row_idx, row in enumerate(rows):
+                    if time.monotonic() >= global_deadline:
+                        break
+                    try:
+                        cols = list(row)
+                    except Exception:
+                        break
+                    for col_idx, cell in enumerate(cols):
+                        if cell:
+                            pos = grid_positions[row_idx * 3 + col_idx]
+                            obs = sim.step(click_enum, data=pos)
+                            plan.append(pos)
+                            lc = int(getattr(obs, "levels_completed", 0) or 0)
+                            if lc > start_levels or self._state_name(obs) == "WIN":
+                                return plan
+        finally:
+            gc.enable()
+
+        return plan if plan else None

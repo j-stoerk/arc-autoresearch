@@ -395,6 +395,7 @@ class Agent:
                 raw_env, simple_actions, start_levels,
                 node_budget=max(50, plan_nodes),
                 global_deadline=self._eval_start + TIME_BUDGET - 10,
+                all_actions=actions,
             )
             # If internal_state_bfs ran and found nothing, persist the exhaustion
             if game_id[:4] in self.mechanics._isb_exhausted and not self.world.is_isb_exhausted(game_id):
@@ -403,27 +404,53 @@ class Agent:
             # future use when games with hidden carry-state are identified.
 
             if mech_plan is not None:
-                by_name = {getattr(a, "name", ""): a for a in actions}
                 goal_reached = False
-                for name in mech_plan:
-                    if time.monotonic() - t_start > TIME_BUDGET:
-                        break
-                    if self.loop.budget_exhausted(env.actions_taken, env.action_budget):
-                        break
-                    action = by_name.get(name)
-                    if action is None:
-                        break
-                    obs = raw_env.step(action)
-                    env.actions_taken += 1
-                    env.last_obs = obs
-                    if int(getattr(obs, "levels_completed", 0) or 0) > start_levels:
-                        goal_reached = True
-                        break
-                    if _state_name(obs) == "WIN":
-                        goal_reached = True
-                        break
-                if goal_reached:
-                    self.world.cache_plan(game_id, "keyboard", mech_plan)
+                # Detect click plan (list[dict]) vs keyboard plan (list[str])
+                is_click_plan = bool(mech_plan) and isinstance(mech_plan[0], dict)
+                if is_click_plan:
+                    try:
+                        from arcengine.enums import GameAction as _GameAction
+                        click_action = _GameAction.ACTION6
+                    except ImportError:
+                        click_action = None
+                    if click_action is not None:
+                        for data in mech_plan:
+                            if time.monotonic() - t_start > TIME_BUDGET:
+                                break
+                            if self.loop.budget_exhausted(env.actions_taken, env.action_budget):
+                                break
+                            obs = raw_env.step(click_action, data=data)
+                            env.actions_taken += 1
+                            env.last_obs = obs
+                            if int(getattr(obs, "levels_completed", 0) or 0) > start_levels:
+                                goal_reached = True
+                                break
+                            if _state_name(obs) == "WIN":
+                                goal_reached = True
+                                break
+                    if goal_reached:
+                        self.world.cache_plan(game_id, "click", mech_plan)
+                else:
+                    by_name = {getattr(a, "name", ""): a for a in actions}
+                    for name in mech_plan:
+                        if time.monotonic() - t_start > TIME_BUDGET:
+                            break
+                        if self.loop.budget_exhausted(env.actions_taken, env.action_budget):
+                            break
+                        action = by_name.get(name)
+                        if action is None:
+                            break
+                        obs = raw_env.step(action)
+                        env.actions_taken += 1
+                        env.last_obs = obs
+                        if int(getattr(obs, "levels_completed", 0) or 0) > start_levels:
+                            goal_reached = True
+                            break
+                        if _state_name(obs) == "WIN":
+                            goal_reached = True
+                            break
+                    if goal_reached:
+                        self.world.cache_plan(game_id, "keyboard", mech_plan)
                 ep = Episode(
                     task_id=spec.task_id, trajectory=[], outcome=goal_reached,
                     rhae=0.0, fingerprint=state.grid.flatten().astype(float),
