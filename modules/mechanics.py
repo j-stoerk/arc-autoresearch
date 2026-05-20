@@ -74,7 +74,12 @@ class MechanicsLearner:
         if plan is not None:
             return plan
 
-        # Secondary path: direct solver for piece-placement games (re86 style)
+        # Secondary path: direct solver for delivery games (wa30 style)
+        plan = self._delivery_solver(raw_env, actions, start_levels, global_deadline)
+        if plan is not None:
+            return plan
+
+        # Tertiary path: direct solver for piece-placement games (re86 style)
         plan = self._piece_placement_solver(raw_env, actions, start_levels, global_deadline)
         if plan is not None:
             return plan
@@ -241,6 +246,577 @@ class MechanicsLearner:
             plan = _build_plan_for_direction(fwd_cyc, bck_cyc)
             if plan is not None and _validate_plan(plan):
                 return plan
+        return None
+
+    # ------------------------------------------------------------------ #
+    # Delivery direct solver (wa30 style)                                  #
+    # ------------------------------------------------------------------ #
+
+    def _delivery_solver(self, raw_env, actions, start_levels, global_deadline) -> list[str] | None:
+        """Direct solver for games where ACTION5 picks up/drops movable objects
+        and movement actions navigate the player to place objects at target positions.
+
+        Algorithm:
+        1. Detect: 4 movement actions + 1 interaction action (ACTION5).
+        2. Probe interaction to detect pickup/drop semantics.
+        3. Use local_state_key BFS to build a navigation graph.
+        4. Identify objects (sprites that can be picked up) and target positions.
+        5. Plan sequence: navigate to each object, pick up, navigate to target, drop.
+        6. Try all orderings for 2-3 objects. Validate on deepcopy.
+        """
+        import time
+        import itertools
+
+        if time.monotonic() >= global_deadline:
+            return None
+
+        action_map = {getattr(a, "name", ""): a for a in actions}
+        game = getattr(raw_env, "_game", None)
+        if game is None:
+            return None
+        level = getattr(game, "current_level", None)
+        if level is None:
+            return None
+
+        # Step 1: classify actions — movement (xy changes) vs interaction (neither xy nor pix)
+        mover_acts: list[tuple[str, int, int]] = []  # (name, dx, dy)
+        interact_acts: list[str] = []
+        xy0 = _xy_set(raw_env)
+        ph0 = _pix_key(raw_env)
+
+        for nm, act in action_map.items():
+            probe = copy.deepcopy(raw_env)
+            gc.disable()
+            try:
+                probe.step(act)
+            finally:
+                gc.enable()
+            xy1 = _xy_set(probe)
+            ph1 = _pix_key(probe)
+            if xy1 != xy0:
+                # Position change — record delta
+                sprites0 = {(getattr(s, "_x", 0), getattr(s, "_y", 0)) for s in getattr(level, "_sprites", [])}
+                level1 = getattr(probe._game, "current_level", None)
+                sprites1 = {(getattr(s, "_x", 0), getattr(s, "_y", 0)) for s in getattr(level1, "_sprites", [])} if level1 else set()
+                moved = sprites1 - sprites0
+                gone = sprites0 - sprites1
+                if moved and gone:
+                    new_pos = next(iter(moved))
+                    old_pos = next(iter(gone))
+                    mover_acts.append((nm, new_pos[0] - old_pos[0], new_pos[1] - old_pos[1]))
+            elif ph1 == ph0:
+                # Neither xy nor pix changed → potential interaction action
+                interact_acts.append(nm)
+
+        if not mover_acts or not interact_acts:
+            return None
+        # All movers must use the same step size (max of |dx|, |dy|)
+        if len({max(abs(dx), abs(dy)) for _, dx, dy in mover_acts}) != 1:
+            return None
+
+        step = max(abs(dx) + abs(dy) for _, dx, dy in mover_acts)
+        if step == 0:
+            return None
+
+        interact_nm = interact_acts[0]
+        move_to_act = {(dx, dy): nm for nm, dx, dy in mover_acts}
+
+        # Step 2: Detect delivery semantics — probe interaction at each object neighbor
+        # A delivery game has objects that can be picked up (interaction changes something)
+        # and a win condition that requires them at target positions.
+        all_sprites = list(getattr(level, "_sprites", []))
+
+        # Find player sprite (moves with mover actions)
+        first_mover_nm, first_dx, first_dy = mover_acts[0]
+        test_probe = copy.deepcopy(raw_env)
+        gc.disable()
+        try:
+            test_probe.step(action_map[first_mover_nm])
+        finally:
+            gc.enable()
+        test_level = getattr(test_probe._game, "current_level", None)
+        test_sprites = list(getattr(test_level, "_sprites", [])) if test_level else []
+        player_idx = None
+        for i, (s0, s1) in enumerate(zip(all_sprites, test_sprites)):
+            if getattr(s0, "_x", 0) != getattr(s1, "_x", 0) or getattr(s0, "_y", 0) != getattr(s1, "_y", 0):
+                player_idx = i
+                break
+        if player_idx is None:
+            return None
+
+        player = all_sprites[player_idx]
+        player_x = getattr(player, "_x", 0)
+        player_y = getattr(player, "_y", 0)
+
+        # Step 3: Build navigation graph via BFS
+        # Map from (x,y) → dict of (dx,dy) → (x',y')
+        nav_graph: dict[tuple[int, int], dict[tuple[int, int], tuple[int, int]]] = {}
+        k0 = self.perception.local_state_key(raw_env)
+        from collections import deque
+        queue = deque([(copy.deepcopy(raw_env), (player_x, player_y))])
+        seen_nav = {k0}
+        gc.disable()
+        try:
+            while queue:
+                cur_env, cur_pos = queue.popleft()
+                if cur_pos not in nav_graph:
+                    nav_graph[cur_pos] = {}
+                for nm, dx, dy in mover_acts:
+                    probe = copy.deepcopy(cur_env)
+                    probe.step(action_map[nm])
+                    nk = self.perception.local_state_key(probe)
+                    probe_level = getattr(probe._game, "current_level", None)
+                    probe_player = list(getattr(probe_level, "_sprites", []))[player_idx] if probe_level else None
+                    if probe_player is None:
+                        continue
+                    new_pos = (getattr(probe_player, "_x", 0), getattr(probe_player, "_y", 0))
+                    nav_graph[cur_pos][(dx, dy)] = new_pos
+                    if nk not in seen_nav:
+                        seen_nav.add(nk)
+                        queue.append((probe, new_pos))
+        finally:
+            gc.enable()
+
+        if len(nav_graph) < 2:
+            return None
+
+        # Step 4: Identify objects (movable sprites, not player) and target positions
+        # Try interaction at each position adjacent to each non-player sprite
+        # If interaction changes sprite positions (pickup detected), it's a delivery game
+        # Build approach direction for pickup: (adx, ady) → player must be at (ox+adx, oy+ady)
+        # and LAST ACTION must be the step TOWARD the object = (-adx,-ady) direction.
+        # So navigate to adj_start=(ox+2*adx, oy+2*ady), execute direction action, then interact.
+        object_sprites: list[int] = []  # (sprite_idx, adx, ady) tuples
+        object_approach: dict[int, tuple[int,int]] = {}  # sprite_idx → (adx, ady)
+        for i, s in enumerate(all_sprites):
+            if i == player_idx:
+                continue
+            ox, oy = getattr(s, "_x", 0), getattr(s, "_y", 0)
+            for adx, ady in [(0, step), (0, -step), (step, 0), (-step, 0)]:
+                adj = (ox + adx, oy + ady)
+                adj_start = (ox + 2*adx, oy + 2*ady)
+                # Need adj and adj_start in nav_graph (or just adj if adj_start is off-grid)
+                if adj not in nav_graph:
+                    continue
+                direction_nm = move_to_act.get((-adx, -ady))  # action to move toward object
+                if direction_nm is None:
+                    continue
+                # Navigate to adj_start (or adj if adj_start not reachable)
+                start_pos = adj_start if adj_start in nav_graph else adj
+                path = self._find_path(nav_graph, (player_x, player_y), start_pos, step, move_to_act)
+                if path is None:
+                    path = self._find_path(nav_graph, (player_x, player_y), adj, step, move_to_act)
+                if path is None:
+                    continue
+                # Build: path_to_start + [direction_step_if_needed] + [interact]
+                # If we navigated to adj directly (not adj_start), add the direction step manually
+                approach_path = path[:]
+                if start_pos == adj_start:
+                    approach_path.append(direction_nm)  # one step toward object
+                # Execute approach + interaction and check if pickup happened
+                test_e = copy.deepcopy(raw_env)
+                gc.disable()
+                try:
+                    for pnm in approach_path:
+                        test_e.step(action_map[pnm])
+                    g_before = getattr(test_e, "_game", None)
+                    carry_before = 0
+                    for attr in ("nsevyuople", "_held", "_carrying"):
+                        v = getattr(g_before, attr, None)
+                        if v is not None:
+                            carry_before = len(v) if hasattr(v, "__len__") else int(bool(v))
+                            break
+                    old_k = self.perception.local_state_key(test_e)
+                    test_e.step(action_map[interact_nm])
+                    new_k = self.perception.local_state_key(test_e)
+                    g_after = getattr(test_e, "_game", None)
+                    carry_after = 0
+                    for attr in ("nsevyuople", "_held", "_carrying"):
+                        v = getattr(g_after, attr, None)
+                        if v is not None:
+                            carry_after = len(v) if hasattr(v, "__len__") else int(bool(v))
+                            break
+                finally:
+                    gc.enable()
+                # Pickup detected if: carry state increased OR state key changed
+                if carry_after > carry_before or new_k != old_k:
+                    object_sprites.append(i)
+                    object_approach[i] = (adx, ady)
+                    break  # this sprite is a pickup object
+
+        if not object_sprites:
+            return None
+
+        # Step 5: Find safe/target positions for each object
+        # Safe positions: check game win condition at each reachable position for each object
+        # Simple heuristic: simulate moving each object to each nav position and check win
+        reachable_positions = list(nav_graph.keys())
+
+        # Find all safe positions in the nav_graph (reachable positions where win fn returns True)
+        game_obj = getattr(raw_env, "_game", None)
+        safe_fn = None
+        for attr_name in ["shbxbhnhjc", "is_safe", "_is_safe"]:
+            fn = getattr(game_obj, attr_name, None)
+            if fn is not None and callable(fn):
+                safe_fn = fn
+                break
+        if safe_fn is None:
+            return None
+
+        all_safe_positions: list[tuple[int, int]] = []
+        for pos in reachable_positions:
+            try:
+                if safe_fn((pos[0], pos[1])):
+                    all_safe_positions.append(pos)
+            except Exception:
+                pass
+
+        # Need at least as many safe positions as objects
+        if len(all_safe_positions) < len(object_sprites):
+            return None
+
+        # Assign UNIQUE target positions to each object (different safe position per object)
+        # Use the first N safe positions (sorted for determinism)
+        all_safe_positions = sorted(set(all_safe_positions))
+        target_positions: list[tuple[int, int]] = []
+        for i, obj_idx in enumerate(object_sprites):
+            ox, oy = getattr(all_sprites[obj_idx], "_x", 0), getattr(all_sprites[obj_idx], "_y", 0)
+            # Find a safe position not already assigned and not the object's initial position
+            found_target = None
+            for pos in all_safe_positions:
+                if pos not in target_positions and pos != (ox, oy):
+                    found_target = pos
+                    break
+            if found_target is None:
+                return None
+            target_positions.append(found_target)
+
+        if len(target_positions) != len(object_sprites):
+            return None
+
+        # Step 6: Plan delivery sequence for each object ordering
+        n_objs = len(object_sprites)
+        for obj_order in itertools.permutations(range(n_objs)):
+            if time.monotonic() >= global_deadline:
+                return None
+            plan = self._build_delivery_plan(
+                raw_env, all_sprites, player_idx, object_sprites, target_positions,
+                list(obj_order), nav_graph, step, move_to_act, interact_nm, action_map,
+                object_approach,
+            )
+            if plan is not None:
+                # Validate
+                val = copy.deepcopy(raw_env)
+                gc.disable()
+                try:
+                    for nm in plan:
+                        act = action_map.get(nm)
+                        if act is None:
+                            break
+                        obs = val.step(act)
+                        if int(getattr(obs, "levels_completed", 0) or 0) > start_levels:
+                            return plan
+                        if self._state_name(obs) == "WIN":
+                            return plan
+                finally:
+                    gc.enable()
+        return None
+
+    def _find_path(
+        self,
+        nav_graph: dict,
+        start: tuple[int, int],
+        goal: tuple[int, int],
+        step: int,
+        move_to_act: dict,
+    ) -> list[str] | None:
+        """BFS path from start to goal using precomputed navigation graph."""
+        if start == goal:
+            return []
+        from collections import deque
+        queue = deque([(start, [])])
+        seen = {start}
+        while queue:
+            pos, path = queue.popleft()
+            for (dx, dy), new_pos in nav_graph.get(pos, {}).items():
+                if new_pos in seen:
+                    continue
+                nm = move_to_act.get((dx, dy))
+                if nm is None:
+                    continue
+                new_path = path + [nm]
+                if new_pos == goal:
+                    return new_path
+                seen.add(new_pos)
+                queue.append((new_pos, new_path))
+        return None
+
+    def _build_delivery_plan(
+        self,
+        raw_env, all_sprites, player_idx, object_sprites, target_positions,
+        obj_order, nav_graph, step, move_to_act, interact_nm, action_map,
+        object_approach=None,
+    ) -> list[str] | None:
+        """Build a plan that picks up objects in obj_order and delivers them to targets."""
+        plan: list[str] = []
+        sim_env = copy.deepcopy(raw_env)
+        gc.disable()
+        try:
+            for i in obj_order:
+                obj_idx = object_sprites[i]
+                target_pos = target_positions[i]
+
+                # Find current player and object positions from sim_env.
+                # Use tag lookup because drops may reorder the sprite list (like tr87's wpbnovjwkv).
+                sim_level = getattr(sim_env._game, "current_level", None)
+                if sim_level is None:
+                    return None
+                # Find player by checking which sprite has the same tags as original player
+                player_tags = tuple(sorted(getattr(all_sprites[player_idx], "tags", [])))
+                cur_player = None
+                for s in getattr(sim_level, "_sprites", []):
+                    if tuple(sorted(getattr(s, "tags", []))) == player_tags:
+                        cur_player = s
+                        break
+                if cur_player is None:
+                    return None
+                # Find target object by its INITIAL position (all geezpjgiyd sprites share same tags,
+                # so tag-based lookup would find the wrong one).
+                obj_initial_pos = (getattr(all_sprites[obj_idx], "_x", 0), getattr(all_sprites[obj_idx], "_y", 0))
+                obj_tags = tuple(sorted(getattr(all_sprites[obj_idx], "tags", [])))
+                delivered_targets = set(target_positions[k] for k in obj_order[:obj_order.index(i)])
+                cur_obj = None
+                # First: look for the object at its expected initial position (most reliable)
+                for s in getattr(sim_level, "_sprites", []):
+                    if tuple(sorted(getattr(s, "tags", []))) == obj_tags:
+                        pos = (getattr(s, "_x", 0), getattr(s, "_y", 0))
+                        if pos == obj_initial_pos:
+                            cur_obj = s
+                            break
+                # Fallback: look for any undelivered object with same tags
+                if cur_obj is None:
+                    for s in getattr(sim_level, "_sprites", []):
+                        if tuple(sorted(getattr(s, "tags", []))) == obj_tags:
+                            pos = (getattr(s, "_x", 0), getattr(s, "_y", 0))
+                            if pos not in delivered_targets:
+                                cur_obj = s
+                                break
+                if cur_obj is None:
+                    return None
+                cur_player_pos = (getattr(cur_player, "_x", 0), getattr(cur_player, "_y", 0))
+                cur_obj_pos = (getattr(cur_obj, "_x", 0), getattr(cur_obj, "_y", 0))
+
+                # Determine approach: (adx, ady) = player offset from object
+                # The approach direction action = move_to_act[(-adx, -ady)]
+                approach = object_approach.get(obj_idx) if object_approach else None
+                pickup_done = False
+
+                # Try stored approach first, then all 4 directions
+                _all_approaches = [(0,step),(0,-step),(step,0),(-step,0)]
+                _ordered_approaches = ([approach] + _all_approaches) if approach else _all_approaches
+                # blocked = positions of already-delivered objects (solid walls for navigation)
+                delivered_idx = obj_order[:obj_order.index(i)]
+                blocked: set = set()
+                for prev_i in delivered_idx:
+                    blocked.add(target_positions[prev_i])
+
+                pickup_done = False
+                pickup_adx, pickup_ady = 0, 0
+
+                for adx, ady in _ordered_approaches:
+                    adj = (cur_obj_pos[0] + adx, cur_obj_pos[1] + ady)
+                    adj_start = (cur_obj_pos[0] + 2*adx, cur_obj_pos[1] + 2*ady)
+                    direction_nm = move_to_act.get((-adx, -ady))
+                    if direction_nm is None:
+                        continue
+                    if adj in blocked or adj_start in blocked:
+                        continue
+
+                    # Fast navigation to adj_start using nav_graph with blocked positions
+                    path_start = self._find_nav_path(nav_graph, cur_player_pos, adj_start, move_to_act, blocked)
+                    if path_start is None:
+                        # Try adj directly
+                        path_start = self._find_nav_path(nav_graph, cur_player_pos, adj, move_to_act, blocked)
+                        if path_start is None:
+                            continue
+                        if not path_start or path_start[-1] != direction_nm:
+                            continue
+                        # Execute path to adj (last action was direction_nm)
+                        for nm in path_start:
+                            sim_env.step(action_map[nm])
+                            plan.append(nm)
+                        sim_env.step(action_map[interact_nm])
+                        plan.append(interact_nm)
+                        pickup_done = True
+                        pickup_adx, pickup_ady = adx, ady
+                        break
+                    else:
+                        # Execute: path_to_adj_start + direction_step
+                        for nm in path_start:
+                            sim_env.step(action_map[nm])
+                            plan.append(nm)
+                        sim_env.step(action_map[direction_nm])
+                        plan.append(direction_nm)
+                        sim_env.step(action_map[interact_nm])
+                        plan.append(interact_nm)
+                        pickup_done = True
+                        pickup_adx, pickup_ady = adx, ady
+                        break
+
+                if not pickup_done:
+                    return None
+
+                adx, ady = pickup_adx, pickup_ady
+
+                # After pickup: carried object has offset (-adx, -ady) from player.
+                # Player must be at (tx+adx, ty+ady) to drop at target_pos (tx,ty).
+                drop_player_pos = (target_pos[0] + adx, target_pos[1] + ady)
+                carry_offset = (-adx, -ady)
+
+                # Get player's current position after pickup
+                sim_level2 = getattr(sim_env._game, "current_level", None)
+                if sim_level2 is None:
+                    return None
+                cur_player2 = None
+                for s in getattr(sim_level2, "_sprites", []):
+                    if tuple(sorted(getattr(s, "tags", []))) == player_tags:
+                        cur_player2 = s
+                        break
+                if cur_player2 is None:
+                    return None
+                cur_player_pos2 = (getattr(cur_player2, "_x", 0), getattr(cur_player2, "_y", 0))
+
+                # Fast carry navigation using nav_graph with carry offset and blocked positions.
+                # passable_pos = object's original position (player can pass through it when carrying)
+                path_to_target = self._find_nav_path(
+                    nav_graph, cur_player_pos2, drop_player_pos, move_to_act,
+                    blocked=blocked, carry_offset=carry_offset,
+                    passable_pos=cur_obj_pos,
+                )
+                if path_to_target is None:
+                    return None
+
+                # Execute navigation to drop position
+                for nm in path_to_target:
+                    sim_env.step(action_map[nm])
+                    plan.append(nm)
+
+                # Drop (object lands at target_pos)
+                sim_env.step(action_map[interact_nm])
+                plan.append(interact_nm)
+        finally:
+            gc.enable()
+
+        return plan
+
+    def _find_nav_path(
+        self, nav_graph, start, goal, move_to_act,
+        blocked: set | None = None,
+        carry_offset: tuple | None = None,
+        passable_pos: tuple | None = None,  # player can pass through this pos (picked-up obj's origin)
+    ) -> list[str] | None:
+        """Fast BFS using precomputed nav_graph with optional carry offset and blocked positions.
+
+        blocked: set of (x,y) positions the player cannot enter (occupied by placed objects).
+        carry_offset: if carrying an object, (dx,dy) offset of carried object from player.
+                      If carry_offset=(dx,dy): player at (px,py) → object at (px+dx,py+dy).
+                      Move blocked if (new_px+dx, new_py+dy) is in blocked.
+        passable_pos: a position that nav_graph says is blocked (was an object) but is now
+                      passable because that object is being carried. When a move (dx,dy)
+                      would normally lead to new_pos==pos (blocked), but pos+(dx,dy)==passable_pos,
+                      override to allow the move.
+        """
+        if start == goal:
+            return []
+        from collections import deque
+        queue = deque([(start, [])])
+        seen = {start}
+        while queue:
+            pos, path = queue.popleft()
+            for (dx, dy), new_pos in nav_graph.get(pos, {}).items():
+                # Check if blocked by nav_graph: new_pos == pos means the original BFS saw a wall
+                actual_new_pos = new_pos
+                if new_pos == pos:
+                    # Maybe this was blocked by the carried object's original position
+                    candidate = (pos[0] + dx, pos[1] + dy)
+                    if passable_pos and candidate == passable_pos:
+                        actual_new_pos = candidate  # override: allow passage
+                    else:
+                        continue  # truly blocked
+                if blocked and actual_new_pos in blocked:
+                    continue  # player would enter blocked cell
+                if carry_offset:
+                    new_obj = (actual_new_pos[0] + carry_offset[0], actual_new_pos[1] + carry_offset[1])
+                    if blocked and new_obj in blocked:
+                        continue  # carried object would enter blocked cell
+                nm = move_to_act.get((dx, dy))
+                if nm is None:
+                    continue
+                if actual_new_pos in seen:
+                    continue
+                new_path = path + [nm]
+                if actual_new_pos == goal:
+                    return new_path
+                seen.add(actual_new_pos)
+                # For passable_pos override positions: also add neighbors by direct offset
+                # (nav_graph may not have this position since it was an obstacle).
+                if actual_new_pos == passable_pos and actual_new_pos not in nav_graph:
+                    # Synthetic nav: treat passable_pos as navigable, add its ±step neighbors
+                    queue.append((actual_new_pos, new_path))
+                else:
+                    queue.append((actual_new_pos, new_path))
+        return None
+
+    def _find_path_ignoring_pos(
+        self, raw_env, sim_env, player_idx, start, goal, action_map, step, move_to_act,
+        player_tags=None, max_nodes: int = 300,
+    ) -> list[str] | None:
+        """BFS pathfinding using sim_env (with held object) to correctly handle carry state.
+        Uses tag-based player lookup to handle sprite list reordering.
+        """
+        if start == goal:
+            return []
+        # Determine player tags for robust lookup
+        if player_tags is None:
+            game0 = getattr(raw_env, "_game", None)
+            level0 = getattr(game0, "current_level", None) if game0 else None
+            sprites0 = list(getattr(level0, "_sprites", [])) if level0 else []
+            if player_idx < len(sprites0):
+                player_tags = tuple(sorted(getattr(sprites0[player_idx], "tags", [])))
+        from collections import deque
+        queue = deque([(copy.deepcopy(sim_env), start, [])])
+        seen = {start}
+        nodes = 0
+        gc.disable()
+        try:
+            while queue and nodes < max_nodes:
+                cur, pos, path = queue.popleft()
+                nodes += 1
+                for (dx, dy), nm in move_to_act.items():
+                    pr = copy.deepcopy(cur)
+                    pr.step(action_map[nm])
+                    pr_level = getattr(pr._game, "current_level", None)
+                    pr_sprites = list(getattr(pr_level, "_sprites", [])) if pr_level else []
+                    # Find player by tag (robust against reordering)
+                    new_pos = None
+                    if player_tags:
+                        for s in pr_sprites:
+                            if tuple(sorted(getattr(s, "tags", []))) == player_tags:
+                                new_pos = (getattr(s, "_x", 0), getattr(s, "_y", 0))
+                                break
+                    if new_pos is None:
+                        if not pr_sprites or player_idx >= len(pr_sprites):
+                            continue
+                        new_pos = (getattr(pr_sprites[player_idx], "_x", 0), getattr(pr_sprites[player_idx], "_y", 0))
+                    if new_pos in seen:
+                        continue
+                    new_path = path + [nm]
+                    if new_pos == goal:
+                        return new_path
+                    seen.add(new_pos)
+                    queue.append((pr, new_pos, new_path))
+        finally:
+            gc.enable()
         return None
 
     # ------------------------------------------------------------------ #

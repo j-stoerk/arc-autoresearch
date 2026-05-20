@@ -228,6 +228,143 @@ class Search:
 
         return None, nodes, len(best_g)
 
+    def relevant_full_key_bfs_plan(
+        self,
+        raw_env,
+        actions,
+        start_levels: int,
+        node_budget: int,
+        perception,
+        _state_name,
+        global_deadline: float = float("inf"),
+    ) -> tuple[list[str] | None, int, int]:
+        """BFS using relevant_full_key (position+pix hash for dynamic sprites only).
+
+        First discovers which sprite indices change during a short exploration,
+        then runs A* using only those indices in the state key. Much faster than
+        full_state_key for games with many static background sprites.
+        """
+        max_depth = 100  # allow deeper search for pickup+place games
+
+        def _game_score(env):
+            g = getattr(env, "_game", None)
+            return int(getattr(g, "_score", 0) or 0) if g else 0
+
+        def _win_score(env):
+            g = getattr(env, "_game", None)
+            return int(getattr(g, "_win_score", 1000) or 1000) if g else 1000
+
+        # Phase 1: discover relevant sprite indices via short local BFS
+        game = getattr(raw_env, "_game", None)
+        if game is None:
+            return None, 0, 0
+        level = getattr(game, "current_level", None)
+        if level is None:
+            return None, 0, 0
+        sprites0 = list(getattr(level, "_sprites", []))
+        if not sprites0:
+            return None, 0, 0
+
+        import numpy as np
+        px0_hashes = []
+        for s in sprites0:
+            px = getattr(s, "pixels", None)
+            px0_hashes.append(hash(np.asarray(px, dtype=np.int32).tobytes()) if px is not None else 0)
+
+        changed_indices: set[int] = set()
+        init_key = perception.local_state_key(raw_env)
+        disc_ctr = 0
+        disc_heap = [(0, 0, disc_ctr, copy.deepcopy(raw_env), [])]
+        disc_seen = {init_key}
+        disc_nodes = 0
+
+        gc.disable()
+        try:
+            while disc_heap and disc_nodes < 200 and time.monotonic() < global_deadline:
+                _, g, _, cur, plan = heapq.heappop(disc_heap)
+                disc_nodes += 1
+                # Record which sprites changed
+                cur_level = getattr(cur._game, "current_level", None)
+                cur_sprites = list(getattr(cur_level, "_sprites", [])) if cur_level else []
+                for i, (s0, s1) in enumerate(zip(sprites0, cur_sprites)):
+                    if i in changed_indices:
+                        continue
+                    if getattr(s0, "_x", 0) != getattr(s1, "_x", 0) or getattr(s0, "_y", 0) != getattr(s1, "_y", 0):
+                        changed_indices.add(i)
+                    else:
+                        px1 = getattr(s1, "pixels", None)
+                        ph1 = hash(np.asarray(px1, dtype=np.int32).tobytes()) if px1 is not None else 0
+                        if ph1 != px0_hashes[i]:
+                            changed_indices.add(i)
+                for action in actions:
+                    try:
+                        nxt = copy.deepcopy(cur)
+                        obs = nxt.step(action)
+                    except Exception:
+                        continue
+                    st = _state_name(obs)
+                    if int(getattr(obs, "levels_completed", 0) or 0) > start_levels:
+                        return plan + [getattr(action, "name", str(action))], disc_nodes, 1
+                    if st == "WIN":
+                        return plan + [getattr(action, "name", str(action))], disc_nodes, 1
+                    if st == "NOT_FINISHED" and g < 30:
+                        nk = perception.local_state_key(nxt)
+                        if nk not in disc_seen:
+                            disc_seen.add(nk)
+                            disc_ctr += 1
+                            disc_heap.append((g + 1, g + 1, disc_ctr, nxt, plan + [getattr(action, "name", str(action))]))
+        finally:
+            gc.enable()
+
+        if not changed_indices:
+            return None, disc_nodes, len(disc_seen)
+
+        relevant_indices = sorted(changed_indices)
+
+        # Phase 2: full BFS using relevant_full_key
+        ws = _win_score(raw_env)
+        h0 = ws - _game_score(raw_env)
+        ctr = 0
+        heap = [(h0, 0, ctr, copy.deepcopy(raw_env), [])]
+        best_g: dict = {}
+        nodes = disc_nodes
+
+        gc.disable()
+        try:
+            while heap and nodes < node_budget and time.monotonic() < global_deadline:
+                f, g, _, current, plan = heapq.heappop(heap)
+                nodes += 1
+                key = perception.relevant_full_key(current, relevant_indices)
+                if key in best_g and best_g[key] <= g:
+                    continue
+                best_g[key] = g
+                if len(plan) >= max_depth:
+                    continue
+
+                for action in actions:
+                    try:
+                        nxt = copy.deepcopy(current)
+                        obs = nxt.step(action)
+                    except Exception:
+                        continue
+                    new_plan = plan + [getattr(action, "name", str(action))]
+                    obs_state = _state_name(obs)
+                    if int(getattr(obs, "levels_completed", 0) or 0) > start_levels:
+                        return new_plan, nodes, len(best_g)
+                    if obs_state == "WIN":
+                        return new_plan, nodes, len(best_g)
+                    if obs_state == "NOT_FINISHED":
+                        new_g = g + 1
+                        new_key = perception.relevant_full_key(nxt, relevant_indices)
+                        if new_key not in best_g or best_g[new_key] > new_g:
+                            new_h = ws - _game_score(nxt)
+                            ctr += 1
+                            heapq.heappush(heap, (new_g + new_h, new_g, ctr, nxt, new_plan))
+        finally:
+            gc.enable()
+
+        return None, nodes, len(best_g)
+
     def click_bfs_plan(
         self,
         raw_env,

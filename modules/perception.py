@@ -121,6 +121,29 @@ class Perception:
                 parts.append((int(getattr(s, "_x", 0)), int(getattr(s, "_y", 0)), ph))
         return tuple(parts)
 
+    def relevant_full_key(self, raw_env, relevant_indices: list[int]) -> tuple:
+        """Position+pixel hash key for a subset of sprites (by list index).
+
+        Much faster than full_state_key when only a few sprites are dynamic
+        (e.g. player + 3 movable objects in a 128-sprite game).
+        """
+        import numpy as np
+        game = getattr(raw_env, "_game", None)
+        if game is None:
+            return (id(raw_env),)
+        parts: list = [getattr(game, "_current_level_index", 0)]
+        level = getattr(game, "current_level", None)
+        if level is None:
+            return tuple(parts)
+        sprites = list(getattr(level, "_sprites", []))
+        for i in relevant_indices:
+            if i < len(sprites):
+                s = sprites[i]
+                px = getattr(s, "pixels", None)
+                ph = hash(np.asarray(px, dtype=np.int32).tobytes()) if px is not None else 0
+                parts.append((int(getattr(s, "_x", 0)), int(getattr(s, "_y", 0)), ph))
+        return tuple(parts)
+
     # ------------------------------------------------------------------ #
     # LeCun JEPA-inspired compressed state representation                  #
     # ------------------------------------------------------------------ #
