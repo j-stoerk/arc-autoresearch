@@ -42,9 +42,14 @@ e823fb6	0.403077	3.8	keep	gc.disable() around all BFS loops + sprite-extent bbox
 99d217a	0.403077	3.8	keep	A* keyboard BFS (f=g+h, h=win_score-score): sk48 100s→75s, total 161s→136s (-25s), same score
 caef6fe	0.403077	3.8	keep	refactor into modules + plan cache + adaptive budgets: 2nd run 160s→28s; system now learns node caps and caches winning plans across sessions
 786826b	0.403077	3.8	keep	mixed-game click BFS fallback + exhausted-game tracking (r11l/tn36/ka59/sb26/su15): 39.5s stable
-a23c16e	0.403077	3.8	keep	LeCun world model: name+tags in state key (fixes sprite-swap games), human-action fallback for click BFS; 32s (-8s)
+a23c16e	0.403077	3.8	discard	LeCun world model: name+tags in state key hurts tr87 (state space explodes); human-action fallback kept
+f735253	0.403077	3.8	keep	revert name in state key: position+tags only (tr87-compatible); bmmtkvkbcdd fallback + WorldModel abstractions; 30s
 (r11l needs 187s total: 24s discovery + 163s BFS with 201 cands; budget=164s; 23s gap; confirmed unsolvable within 300s budget even with gc.disable()+A*)
 (lf52/bp35: confirmed zero position+tag changes for any click; truly opaque with no observable state change via either pixel-hash or position+tag keys)
 (tn36: confirmed zero non-sprite-center grid positions from initial state; sprite BFS exhausted ~600 states; confirmed unsolvable via sprite-click approach)
+b58f034	0.470769	4.4	keep	mechanics learner: direct cycle solver solves tr87 (wpbnovjwkv remove+add was confusing local_state_key; _xy_set reorder-invariant fix)
+f165774	0.513846	5.2	keep	piece placement solver: re86 solved via template matching (selector cycles pieces, match against fixed target sprites)
+f9c13d5	0.590769	6.8	keep	delivery solver: wa30 solved via pickup+place planning (ACTION5 pickup with direction-approach semantics, nav_graph with carry offset)
+71dd607	0.624615	7.4	keep	internal_state_bfs: ls20 solved via enriched state key (player_pos + cklxociuu + shape/color indices); ISB exhaustion cached
 (r11l[13]: BFS with 3 sprite cands exhausts at 21 states; 198 mid-sequence background positions needed; sprite discovery finds sprite[2]@(6,35) dynamically active; 4-sprite BFS exhausts ~100 states no WIN; greedy fails (all-or-nothing score); deepcopy 4.5ms x 201 cands = 0.9s/node too slow for any BFS approach)
 (tn36[22]: click-only game, 30 sprite-center cands, BFS exhausts ~600 unique states in ~107s no WIN; greedy runs 5 score-improvement steps (sprite score is incremental!) then gets stuck; confirmed unsolvable via sprite-click BFS within 300s budget)
