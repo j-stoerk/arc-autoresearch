@@ -288,16 +288,22 @@ class Agent:
                     if int(getattr(obs, "levels_completed", 0) or 0) > start_levels:
                         goal_reached = True
                         break
-            else:  # click
+            else:  # click or mixed click+keyboard
                 try:
                     from arcengine.enums import GameAction as _GameAction
                     click_action = _GameAction.ACTION6
-                    for data in plan:
+                    for item in plan:
                         if time.monotonic() - t_start > TIME_BUDGET:
                             break
                         if self.loop.budget_exhausted(env.actions_taken, env.action_budget):
                             break
-                        obs = raw_env.step(click_action, data=data)
+                        if isinstance(item, dict):
+                            obs = raw_env.step(click_action, data=item)
+                        else:
+                            act = by_name.get(item)
+                            if act is None:
+                                break
+                            obs = raw_env.step(act)
                         env.actions_taken += 1
                         env.last_obs = obs
                         if int(getattr(obs, "levels_completed", 0) or 0) > start_levels:
@@ -405,52 +411,40 @@ class Agent:
 
             if mech_plan is not None:
                 goal_reached = False
-                # Detect click plan (list[dict]) vs keyboard plan (list[str])
-                is_click_plan = bool(mech_plan) and isinstance(mech_plan[0], dict)
-                if is_click_plan:
-                    try:
-                        from arcengine.enums import GameAction as _GameAction
-                        click_action = _GameAction.ACTION6
-                    except ImportError:
-                        click_action = None
-                    if click_action is not None:
-                        for data in mech_plan:
-                            if time.monotonic() - t_start > TIME_BUDGET:
-                                break
-                            if self.loop.budget_exhausted(env.actions_taken, env.action_budget):
-                                break
-                            obs = raw_env.step(click_action, data=data)
-                            env.actions_taken += 1
-                            env.last_obs = obs
-                            if int(getattr(obs, "levels_completed", 0) or 0) > start_levels:
-                                goal_reached = True
-                                break
-                            if _state_name(obs) == "WIN":
-                                goal_reached = True
-                                break
-                    if goal_reached:
-                        self.world.cache_plan(game_id, "click", mech_plan)
-                else:
-                    by_name = {getattr(a, "name", ""): a for a in actions}
-                    for name in mech_plan:
-                        if time.monotonic() - t_start > TIME_BUDGET:
+                # Mixed plan: each item is str (keyboard) or dict (click position).
+                # Pure-click plans start with dict; pure-keyboard plans start with str.
+                try:
+                    from arcengine.enums import GameAction as _GameAction
+                    click_action = _GameAction.ACTION6
+                except ImportError:
+                    click_action = None
+                by_name = {getattr(a, "name", ""): a for a in actions}
+                for item in mech_plan:
+                    if time.monotonic() - t_start > TIME_BUDGET:
+                        break
+                    if self.loop.budget_exhausted(env.actions_taken, env.action_budget):
+                        break
+                    if isinstance(item, dict):
+                        if click_action is None:
                             break
-                        if self.loop.budget_exhausted(env.actions_taken, env.action_budget):
-                            break
-                        action = by_name.get(name)
+                        obs = raw_env.step(click_action, data=item)
+                    else:
+                        action = by_name.get(item)
                         if action is None:
                             break
                         obs = raw_env.step(action)
-                        env.actions_taken += 1
-                        env.last_obs = obs
-                        if int(getattr(obs, "levels_completed", 0) or 0) > start_levels:
-                            goal_reached = True
-                            break
-                        if _state_name(obs) == "WIN":
-                            goal_reached = True
-                            break
-                    if goal_reached:
-                        self.world.cache_plan(game_id, "keyboard", mech_plan)
+                    env.actions_taken += 1
+                    env.last_obs = obs
+                    lc = int(getattr(obs, "levels_completed", 0) or 0)
+                    if lc > start_levels:
+                        goal_reached = True
+                        break
+                    if _state_name(obs) == "WIN":
+                        goal_reached = True
+                        break
+                if goal_reached:
+                    # Cache as "mixed" plan for replay
+                    self.world.cache_plan(game_id, "click", mech_plan)
                 ep = Episode(
                     task_id=spec.task_id, trajectory=[], outcome=goal_reached,
                     rhae=0.0, fingerprint=state.grid.flatten().astype(float),

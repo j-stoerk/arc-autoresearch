@@ -1506,18 +1506,23 @@ class MechanicsLearner:
 
     def _spell_casting_solver(
         self, raw_env, actions, start_levels, global_deadline,
-    ) -> list[dict] | None:
-        """Direct solver for games with a spell-casting mechanic:
-        - zzpoabuniyn: dict mapping spell_name → 3×3 boolean pattern
-        - ijhfdcamokt: current spell name (or None if need to select spell)
-        - qytejzcythm: True when a demo animation should be triggered first
-        - 3×3 grid of clickable cells (from bmmtkvkbcdd ACTION6 entries)
-        - Spell-selection buttons (sprites with "sptivk" tag)
+    ) -> list | None:
+        """Direct solver for games with a spell-casting mechanic (sc25).
 
-        Returns a list[dict] click plan (not list[str] keyboard plan).
-        Agent.py detects the dict type and executes via ACTION6.
+        Returns a mixed plan: list[str | dict] where str = keyboard action
+        name and dict = click position {"x":..., "y":...}.
+        Agent.py dispatches each item by type.
+
+        Algorithm per level:
+        1. Select spell via sptivk-... button click (if ijhfdcamokt=None)
+        2. For fibcey: first press ACTION4 (face right) so fireball hits target
+        3. Demo trigger if qytejzcythm=True (first click on grid)
+        4. Cast spell pattern (click True cells in 3×3 grid)
+        5. Keyboard A* BFS from post-cast state to advance level
+        6. Repeat for each of the win_score levels
         """
         import time
+        import heapq as _heapq
 
         if time.monotonic() >= global_deadline:
             return None
@@ -1545,6 +1550,17 @@ class MechanicsLearner:
         except ImportError:
             return None
 
+        # Camera scale for sprite → display coord conversion
+        _scale = 1
+        try:
+            cam = getattr(game, "camera", None)
+            if cam is not None:
+                result = cam.display_to_grid(4, 4)
+                if result and result[0] > 0:
+                    _scale = 4 // result[0]
+        except Exception:
+            pass
+
         grid_positions: list[dict] = []
         for attr_name in ("bmmtkvkbcdd", "human_actions", "_human_actions"):
             ha_list = getattr(game, attr_name, None)
@@ -1562,115 +1578,200 @@ class MechanicsLearner:
         if len(grid_positions) < 9:
             return None
 
-        # Sort row-major (y first, then x): top-left → bottom-right
         grid_positions.sort(key=lambda p: (p["y"], p["x"]))
 
-        # ── Simulation: build plan by replaying game state ──────────── #
+        # ── Keyboard actions for navigation ──────────────────────────── #
+        kb_actions = [a for a in actions
+                      if not (callable(getattr(a, "is_complex", None)) and a.is_complex())]
+
+        def _kb_bfs(env_, total_lc_, budget=2000):
+            """A* BFS from env_ to find keyboard plan that advances level."""
+            _ws = int(getattr(env_._game, "_win_score", 1000) or 1000)
+            def _score(e): return int(getattr(e._game, "_score", 0) or 0) if e._game else 0
+            def _key(e):
+                _g2 = e._game
+                pp2 = getattr(_g2, "plnqvukupu", None)
+                return (int(pp2.x), int(pp2.y), int(_g2.jdmucabyqar)) if pp2 else (0, 0, 0)
+            _counter = [0]
+            _heap = [(_ws - _score(env_), 0, _counter[0], copy.deepcopy(env_), [])]
+            _bg: dict = {}
+            _nodes = 0
+            gc.disable()
+            try:
+                while _heap and _nodes < budget:
+                    _f, _g, _, _cur, _plan = _heapq.heappop(_heap)
+                    _nodes += 1
+                    _k = _key(_cur)
+                    if _k in _bg and _bg[_k] <= _g:
+                        continue
+                    _bg[_k] = _g
+                    if len(_plan) >= 50:
+                        continue
+                    for _act in kb_actions:
+                        _nxt = copy.deepcopy(_cur)
+                        _obs = _nxt.step(_act)
+                        _lc = int(getattr(_obs, "levels_completed", 0) or 0)
+                        if _lc > total_lc_:
+                            return _plan + [getattr(_act, "name", "")]
+                        if self._state_name(_obs) == "NOT_FINISHED":
+                            _nk = _key(_nxt)
+                            _ng = _g + 1
+                            if _nk not in _bg or _bg[_nk] > _ng:
+                                _counter[0] += 1
+                                _heapq.heappush(_heap, (
+                                    _ng + _ws - _score(_nxt), _ng, _counter[0], _nxt,
+                                    _plan + [getattr(_act, "name", "")]
+                                ))
+            finally:
+                gc.enable()
+            return None
+
+        def _select_spell(sim_, zzp_):
+            """Find and click the first spell button that sets ijhfdcamokt to a valid spell."""
+            sg = sim_._game
+            sl = getattr(sg, "current_level", None)
+            if sl is None:
+                return None
+            # Probe each sptivk-... sprite by clicking its display position
+            for s in getattr(sl, "_sprites", []):
+                nm = str(getattr(s, "name", ""))
+                if not nm.startswith("sptivk-"):
+                    continue
+                if "clzbxlm" in nm or nm in ("sptivk-ui",):
+                    continue
+                sx = (int(getattr(s, "_x", 0)) + 1) * _scale
+                sy = (int(getattr(s, "_y", 0)) + 1) * _scale
+                click_data = {"x": sx, "y": sy}
+                probe = copy.deepcopy(sim_)
+                gc.disable()
+                try:
+                    probe.step(click_enum, data=click_data)
+                finally:
+                    gc.enable()
+                pg = probe._game
+                new_spell = getattr(pg, "ijhfdcamokt", None) if pg else None
+                if new_spell is not None and new_spell in zzp_:
+                    return click_data
+            return None
+
+        # ── Simulation: build mixed plan ──────────────────────────────── #
         sim = copy.deepcopy(raw_env)
-        plan: list[dict] = []
+        plan: list = []  # mixed: str (keyboard) | dict (click)
+        total_lc = start_levels
+
         gc.disable()
         try:
-            for _step in range(ws * 15):  # generous upper bound
+            for _round in range(ws * 8):  # generous upper bound
                 if time.monotonic() >= global_deadline:
                     break
 
-                sg = getattr(sim, "_game", None)
+                sg = sim._game
                 if sg is None:
                     break
-
-                score = int(getattr(sg, "_score", 0) or 0)
-                if score >= ws:
+                if total_lc >= ws:
                     break
 
                 demo_mode = bool(getattr(sg, "qytejzcythm", False))
                 current_spell = getattr(sg, "ijhfdcamokt", None)
 
-                # ── Spell selection ─────────────────────────────────── #
+                # ── Step 1: Select spell if none active ─────────────── #
                 if current_spell is None:
-                    # Probe each non-grid sprite with "sptivk" tag to find spell buttons
-                    sl = getattr(sg, "current_level", None)
-                    if sl is None:
+                    click_data = _select_spell(sim, zzpoabuniyn)
+                    if click_data is None:
                         break
-                    # Detect scale once
-                    scale = 2
-                    try:
-                        cam = getattr(sg, "camera", None)
-                        if cam is not None:
-                            result = cam.display_to_grid(4, 4)
-                            if result and result[0] > 0:
-                                scale = 4 // result[0]
-                    except Exception:
-                        pass
-
-                    found_button = False
-                    for s in getattr(sl, "_sprites", []):
-                        tags_list = list(getattr(s, "tags", []))
-                        tag_str = " ".join(str(t) for t in tags_list)
-                        if "sptivk" not in tag_str:
-                            continue
-                        # Skip pure-grid-cell sprites
-                        if "clzbxlm" in tag_str:
-                            continue
-                        sx = (int(getattr(s, "_x", 0)) + 1) * scale
-                        sy = (int(getattr(s, "_y", 0)) + 1) * scale
-                        click_data = {"x": sx, "y": sy}
-                        # Probe: does clicking this sprite set ijhfdcamokt?
-                        probe = copy.deepcopy(sim)
-                        try:
-                            probe.step(click_enum, data=click_data)
-                        except Exception:
-                            continue
-                        pg = getattr(probe, "_game", None)
-                        new_spell = getattr(pg, "ijhfdcamokt", None) if pg else None
-                        if new_spell is not None and new_spell in zzpoabuniyn:
-                            obs = sim.step(click_enum, data=click_data)
-                            plan.append(click_data)
-                            lc = int(getattr(obs, "levels_completed", 0) or 0)
-                            if lc > start_levels or self._state_name(obs) == "WIN":
-                                return plan
-                            found_button = True
-                            break
-                    if not found_button:
-                        break
-                    continue
-
-                # ── Demo trigger ─────────────────────────────────────── #
-                if demo_mode:
-                    # One click on any grid cell triggers the demo animation
-                    demo_click = grid_positions[0]
-                    obs = sim.step(click_enum, data=demo_click)
-                    plan.append(demo_click)
+                    obs = sim.step(click_enum, data=click_data)
+                    plan.append(click_data)
                     lc = int(getattr(obs, "levels_completed", 0) or 0)
-                    if lc > start_levels or self._state_name(obs) == "WIN":
-                        return plan
+                    if lc > total_lc:
+                        total_lc = lc
+                        if total_lc >= ws:
+                            break
                     continue
 
-                # ── Cast current spell ───────────────────────────────── #
+                # ── Step 2: Demo trigger (level 0 only) ──────────────── #
+                if demo_mode:
+                    obs = sim.step(click_enum, data=grid_positions[0])
+                    plan.append(grid_positions[0])
+                    lc = int(getattr(obs, "levels_completed", 0) or 0)
+                    if lc > total_lc:
+                        total_lc = lc
+                        if total_lc >= ws:
+                            break
+                    continue
+
+                # ── Step 3: Pre-cast orientation for fibcey ──────────── #
+                # fibcey shoots fireball in facing direction (jdmucabyqar).
+                # Must face RIGHT (jdm=3) to hit tagsmh at (55,22) from any
+                # left-of-tagsmh position. Press ACTION4 to set jdm=3.
+                if current_spell == "fibcey":
+                    jdm = int(getattr(sg, "jdmucabyqar", 0))
+                    if jdm != 3 and "ACTION4" in action_map:
+                        obs = sim.step(action_map["ACTION4"])
+                        plan.append("ACTION4")
+                        lc = int(getattr(obs, "levels_completed", 0) or 0)
+                        if lc > total_lc:
+                            total_lc = lc
+                            if total_lc >= ws:
+                                break
+                        # Refresh grid positions (they may have changed via level reset)
+                        sg2 = sim._game
+                        new_gp = []
+                        for attr_name in ("bmmtkvkbcdd", "human_actions"):
+                            ha_list = getattr(sg2, attr_name, None)
+                            if not ha_list:
+                                continue
+                            for ha in ha_list:
+                                if getattr(ha, "id", None) == click_enum:
+                                    d = getattr(ha, "data", {}) or {}
+                                    hx2, hy2 = d.get("x"), d.get("y")
+                                    if hx2 is not None and hy2 is not None:
+                                        new_gp.append({"x": int(hx2), "y": int(hy2)})
+                            if new_gp:
+                                break
+                        if new_gp:
+                            grid_positions[:] = sorted(new_gp, key=lambda p: (p["y"], p["x"]))
+
+                # ── Step 4: Cast current spell ────────────────────────── #
                 pattern = zzpoabuniyn.get(current_spell)
                 if pattern is None:
                     break
-                try:
-                    rows = list(pattern)
-                except Exception:
-                    break
-                if len(rows) != 3:
-                    break
-
-                for row_idx, row in enumerate(rows):
+                cast_won = False
+                for row_idx, row in enumerate(pattern):
                     if time.monotonic() >= global_deadline:
                         break
-                    try:
-                        cols = list(row)
-                    except Exception:
-                        break
-                    for col_idx, cell in enumerate(cols):
+                    for col_idx, cell in enumerate(row):
                         if cell:
                             pos = grid_positions[row_idx * 3 + col_idx]
                             obs = sim.step(click_enum, data=pos)
                             plan.append(pos)
                             lc = int(getattr(obs, "levels_completed", 0) or 0)
-                            if lc > start_levels or self._state_name(obs) == "WIN":
-                                return plan
+                            if lc > total_lc:
+                                total_lc = lc
+                                if total_lc >= ws:
+                                    cast_won = True
+                                    break
+                    if cast_won:
+                        break
+                if cast_won or total_lc >= ws:
+                    break
+
+                # ── Step 5: Keyboard BFS to advance level ─────────────── #
+                kb_plan = _kb_bfs(sim, total_lc)
+                if kb_plan is None:
+                    break
+                for nm in kb_plan:
+                    act = action_map.get(nm)
+                    if act is None:
+                        break
+                    obs = sim.step(act)
+                    plan.append(nm)
+                    lc = int(getattr(obs, "levels_completed", 0) or 0)
+                    if lc > total_lc:
+                        total_lc = lc
+                        if total_lc >= ws:
+                            break
+                if total_lc >= ws:
+                    break
         finally:
             gc.enable()
 
