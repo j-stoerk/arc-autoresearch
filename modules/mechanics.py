@@ -114,6 +114,11 @@ class MechanicsLearner:
         if plan is not None:
             return plan
 
+        # Senary path: ball-placement solver (su15-style click-to-move games)
+        plan = self._ball_placement_solver(raw_env, _full, start_levels, global_deadline)
+        if plan is not None:
+            return plan
+
         # Fallback: generic greedy cycle search (other cycle-to-match games)
         return self._generic_greedy(raw_env, actions, start_levels, node_budget, global_deadline)
 
@@ -2039,3 +2044,189 @@ class MechanicsLearner:
                     toggle_clicks.append({"x": cx, "y": cy})
 
         return toggle_clicks
+
+    # ------------------------------------------------------------------ #
+    # Ball-placement solver (su15 style)                                  #
+    # ------------------------------------------------------------------ #
+
+    def _ball_placement_solver(
+        self, raw_env, all_actions, start_levels, global_deadline
+    ) -> list | None:
+        """Solver for su15-style ball-placement games.
+
+        Mechanic: clicking within radius R of a ball moves it toward the click
+        by up to STEP pixels per frame over FRAMES frames. Solve by computing
+        a greedy path from ball position to goal zone center.
+
+        Detection: lkujttxgs (ball sprites, tag 'zmlxwcvwb'), powykypsm (goal
+        zone sprites, tag 'xkstxyqbs'), kqywaxhmsb (ball→color mapping),
+        dsqlbvwaj (level target spec), ikskfqldi (step), kacsjmxae (radius).
+        """
+        import time
+        import math
+
+        if time.monotonic() >= global_deadline:
+            return None
+
+        game = getattr(raw_env, "_game", None)
+        if game is None:
+            return None
+
+        # Detect su15-style structure
+        lkujttxgs = getattr(game, "lkujttxgs", None)
+        powykypsm = getattr(game, "powykypsm", None)
+        dsqlbvwaj = getattr(game, "dsqlbvwaj", None)
+        kqywaxhmsb = getattr(game, "kqywaxhmsb", {})
+        ikskfqldi = getattr(game, "ikskfqldi", 4)  # pixels per frame
+        kacsjmxae = getattr(game, "kacsjmxae", 8)  # click radius
+
+        if not lkujttxgs or not powykypsm or dsqlbvwaj is None:
+            return None
+
+        # Find ACTION6 (click)
+        click_enum = None
+        for a in all_actions:
+            if getattr(a, "name", "").endswith("6"):
+                click_enum = a
+                break
+        if click_enum is None:
+            return None
+
+        win_score = int(getattr(game, "_win_score", 1) or 1)
+
+        plan = []
+        sim = copy.deepcopy(raw_env)
+
+        gc.disable()
+        try:
+            cur_lc = start_levels
+            while cur_lc < win_score and time.monotonic() < global_deadline:
+                g = getattr(sim, "_game", None)
+                if g is None:
+                    break
+
+                level_plan = self._bp_solve_level(g, click_enum, global_deadline)
+                if level_plan is None:
+                    break
+
+                plan.extend(level_plan)
+                level_advanced = False
+                for click in level_plan:
+                    if time.monotonic() >= global_deadline:
+                        break
+                    obs = sim.step(click_enum, data=click)
+                    new_lc = int(getattr(obs, "levels_completed", 0) or 0)
+                    if new_lc > cur_lc:
+                        cur_lc = new_lc
+                        level_advanced = True
+                        break
+                if not level_advanced:
+                    break
+        finally:
+            gc.enable()
+
+        return plan if plan else None
+
+    def _bp_solve_level(self, game, click_enum, global_deadline) -> list | None:
+        """Compute click sequence to move ball(s) into goal zone for one level."""
+        import time
+        import math
+
+        lkujttxgs = getattr(game, "lkujttxgs", [])
+        powykypsm = getattr(game, "powykypsm", [])
+        kqywaxhmsb = getattr(game, "kqywaxhmsb", {})
+        dsqlbvwaj = getattr(game, "dsqlbvwaj", None)
+        ikskfqldi = getattr(game, "ikskfqldi", 4)
+        kacsjmxae = getattr(game, "kacsjmxae", 8)
+        gdamdvokm = getattr(game, "gdamdvokm", 4)
+        gvvyzrusqq = 10  # min valid click y
+        qsqeqpepjy = 63  # max valid click y (exclusive)
+
+        if not lkujttxgs or not powykypsm or dsqlbvwaj is None:
+            return None
+
+        # Parse target: dsqlbvwaj = [color, count] or list of pairs
+        try:
+            if isinstance(dsqlbvwaj[0], (list, tuple)):
+                targets = [(int(c), int(n)) for c, n in dsqlbvwaj]
+            else:
+                targets = [(int(dsqlbvwaj[0]), int(dsqlbvwaj[1]))]
+        except Exception:
+            return None
+
+        # Find balls that need to reach goal zones
+        # Match ball color to targets
+        zone = powykypsm[0]  # use first zone as target area
+        zone_cx = zone.x + zone.width // 2
+        zone_cy = zone.y + zone.height // 2
+
+        # Maximum step per click = ikskfqldi per frame × gdamdvokm frames
+        # But ball moves TO click position if close enough
+        # Safe step: kacsjmxae * 0.6 (within radius, guarantees movement)
+        safe_step = max(1, int(kacsjmxae * 0.55))
+
+        clicks = []
+        for ball in lkujttxgs:
+            if time.monotonic() >= global_deadline:
+                return None
+
+            ball_cx = ball.x + ball.width // 2
+            ball_cy = ball.y + ball.height // 2
+
+            # Check if already in zone
+            if (zone.x <= ball_cx < zone.x + zone.width and
+                    zone.y <= ball_cy < zone.y + zone.height):
+                continue
+
+            # Compute steps needed to move from ball to zone
+            dx_total = zone_cx - ball_cx
+            dy_total = zone_cy - ball_cy
+            dist = math.sqrt(dx_total * dx_total + dy_total * dy_total)
+
+            if dist < 1:
+                continue
+
+            # Number of clicks to cover the distance
+            # Each click moves ball toward click by safe_step in each axis
+            step_x = safe_step if dx_total > 0 else (-safe_step if dx_total < 0 else 0)
+            step_y = safe_step if dy_total > 0 else (-safe_step if dy_total < 0 else 0)
+
+            cur_bx, cur_by = ball_cx, ball_cy
+            max_clicks = 50
+            for _ in range(max_clicks):
+                if time.monotonic() >= global_deadline:
+                    break
+                # Check if ball is now in zone
+                if (zone.x <= cur_bx < zone.x + zone.width and
+                        zone.y <= cur_by < zone.y + zone.height):
+                    break
+
+                # Compute click toward zone center
+                rem_x = zone_cx - cur_bx
+                rem_y = zone_cy - cur_by
+
+                # Click step: limited by remaining distance and safe_step
+                cx_step = min(safe_step, abs(rem_x)) * (1 if rem_x > 0 else -1)
+                cy_step = min(safe_step, abs(rem_y)) * (1 if rem_y > 0 else -1)
+
+                click_x = cur_bx + cx_step
+                click_y = cur_by + cy_step
+
+                # Clamp to valid click range
+                click_x = max(0, min(click_x, 63))
+                click_y = max(gvvyzrusqq, min(click_y, qsqeqpepjy - 1))
+
+                # Verify click is within radius of ball
+                actual_dist = math.sqrt((click_x - cur_bx)**2 + (click_y - cur_by)**2)
+                if actual_dist > kacsjmxae:
+                    # Scale back to radius
+                    factor = (kacsjmxae - 1) / actual_dist
+                    click_x = int(cur_bx + (click_x - cur_bx) * factor)
+                    click_y = int(cur_by + (click_y - cur_by) * factor)
+                    click_y = max(gvvyzrusqq, min(click_y, qsqeqpepjy - 1))
+
+                clicks.append({"x": int(click_x), "y": int(click_y)})
+                cur_bx = click_x
+                cur_by = click_y
+
+        return clicks if clicks else None
