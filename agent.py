@@ -376,6 +376,62 @@ class Agent:
                     )
                     self.memory.store(ep)
                     return EpisodeResult(spec.task_id, env.actions_taken, goal_reached, 0.0)
+
+            # Phase 2b: MechanicsLearner for click-only games (e.g. visual-programming).
+            # Called with empty simple_actions but all_actions to allow click-based solvers.
+            if not self.world.is_isb_exhausted(game_id):
+                self.mechanics._isb_exhausted = set()
+            else:
+                self.mechanics._isb_exhausted = {game_id[:4]}
+            mech_plan = self.mechanics.learn_and_plan(
+                raw_env, [], start_levels,
+                node_budget=50,
+                global_deadline=self._eval_start + TIME_BUDGET - 10,
+                all_actions=actions,
+            )
+            if game_id[:4] in self.mechanics._isb_exhausted and not self.world.is_isb_exhausted(game_id):
+                self.world.mark_isb_exhausted(game_id)
+
+            if mech_plan is not None:
+                goal_reached = False
+                try:
+                    from arcengine.enums import GameAction as _GameAction
+                    click_action = _GameAction.ACTION6
+                except ImportError:
+                    click_action = None
+                by_name = {getattr(a, "name", ""): a for a in actions}
+                for item in mech_plan:
+                    if time.monotonic() - t_start > TIME_BUDGET:
+                        break
+                    if self.loop.budget_exhausted(env.actions_taken, env.action_budget):
+                        break
+                    if isinstance(item, dict):
+                        if click_action is None:
+                            break
+                        obs = raw_env.step(click_action, data=item)
+                    else:
+                        act = by_name.get(item)
+                        if act is None:
+                            break
+                        obs = raw_env.step(act)
+                    env.actions_taken += 1
+                    env.last_obs = obs
+                    lc = int(getattr(obs, "levels_completed", 0) or 0)
+                    if lc > start_levels:
+                        goal_reached = True
+                        break
+                    if _state_name(obs) == "WIN":
+                        goal_reached = True
+                        break
+                if goal_reached:
+                    self.world.cache_plan(game_id, "click", mech_plan)
+                ep = Episode(
+                    task_id=spec.task_id, trajectory=[], outcome=goal_reached,
+                    rhae=0.0, fingerprint=state.grid.flatten().astype(float),
+                )
+                self.memory.store(ep)
+                return EpisodeResult(spec.task_id, env.actions_taken, goal_reached, 0.0)
+
             return None
 
         # Phase 1: keyboard A* BFS — budget determined by WorldModel (adaptive + learned)

@@ -109,6 +109,11 @@ class MechanicsLearner:
         if plan is not None:
             return plan
 
+        # Quinary path: direct solver for visual-programming games (tn36 style)
+        plan = self._visual_program_solver(raw_env, _full, start_levels, global_deadline)
+        if plan is not None:
+            return plan
+
         # Fallback: generic greedy cycle search (other cycle-to-match games)
         return self._generic_greedy(raw_env, actions, start_levels, node_budget, global_deadline)
 
@@ -1776,3 +1781,261 @@ class MechanicsLearner:
             gc.enable()
 
         return plan if plan else None
+
+    # ------------------------------------------------------------------ #
+    # Visual-programming solver (tn36 style)                              #
+    # ------------------------------------------------------------------ #
+
+    def _visual_program_solver(
+        self, raw_env, all_actions, start_levels, global_deadline
+    ) -> list | None:
+        """Solver for tn36-style visual programming games.
+
+        Game structure: player edits a binary-coded program by clicking Maidxz
+        bit-checkboxes, then clicks a run button (sucqgkbuojsa) to execute it.
+        Win when the piece (htntnzkbzu) reaches target (aqszntqeae).
+
+        Strategy:
+          1. Read mvqheosngn's reference panel (Level 2+) or compute analytically (Level 1).
+          2. Compute which bits to toggle to set the target program.
+          3. Execute toggles + run for each level until game is won.
+        """
+        import time
+
+        if time.monotonic() >= global_deadline:
+            return None
+
+        game = getattr(raw_env, "_game", None)
+        if game is None:
+            return None
+        fdk = getattr(game, "fdksqlmpki", None)
+        if fdk is None:
+            return None
+        brz = getattr(fdk, "bzirenxmrg", None)
+        if brz is None:
+            return None
+
+        # Find ACTION6 (click)
+        click_enum = None
+        for a in all_actions:
+            if getattr(a, "name", "").endswith("6"):
+                click_enum = a
+                break
+        if click_enum is None:
+            return None
+
+        win_score = int(getattr(game, "_win_score", 1) or 1)
+        plan = []
+        sim = copy.deepcopy(raw_env)
+
+        gc.disable()
+        try:
+            cur_lc = start_levels
+            while cur_lc < win_score and time.monotonic() < global_deadline:
+                g = getattr(sim, "_game", None)
+                if g is None:
+                    break
+                fdk_s = getattr(g, "fdksqlmpki", None)
+                if fdk_s is None:
+                    break
+                brz_s = getattr(fdk_s, "bzirenxmrg", None)
+                if brz_s is None:
+                    break
+
+                level_plan = self._vp_solve_level(fdk_s, brz_s, click_enum, global_deadline)
+                if level_plan is None:
+                    break
+
+                plan.extend(level_plan)
+                level_advanced = False
+                for click in level_plan:
+                    if time.monotonic() >= global_deadline:
+                        break
+                    obs = sim.step(click_enum, data=click)
+                    new_lc = int(getattr(obs, "levels_completed", 0) or 0)
+                    if new_lc > cur_lc:
+                        cur_lc = new_lc
+                        level_advanced = True
+                        break
+                if not level_advanced:
+                    break  # plan didn't win this level; abort
+        finally:
+            gc.enable()
+
+        return plan if plan else None
+
+    def _vp_solve_level(self, fdk, brz, click_enum, global_deadline) -> list | None:
+        """Compute toggle clicks + run click to solve the current level."""
+        sxh = getattr(brz, "sxhtkytekm", None)
+        if sxh is None:
+            return None
+        run_click = {"x": sxh.x + sxh._width // 2, "y": sxh.y + sxh._height // 2}
+
+        vup = getattr(brz, "vupcwzjtxu", None)
+        if vup is None or not vup.rzmeklhluf:
+            return None
+
+        current_prog = list(vup.vkuvtkaerv)
+        num_slots = len(current_prog)
+
+        # Try reference from mvqheosngn first (Level 2+)
+        target_prog = self._vp_reference_program(fdk, num_slots)
+
+        # Fall back to analytical (Level 1 / no reference)
+        if target_prog is None:
+            target_prog = self._vp_analytical_program(brz, num_slots)
+
+        # Fall back to brute force simulation (<=12 bits)
+        if target_prog is None:
+            target_prog = self._vp_brute_force(brz, vup, current_prog, global_deadline)
+
+        if target_prog is None:
+            return None
+
+        toggle_clicks = self._vp_compute_toggles(vup, current_prog, target_prog)
+        if toggle_clicks is None:
+            return None
+
+        return toggle_clicks + [run_click]
+
+    def _vp_reference_program(self, fdk, num_slots) -> list | None:
+        """Read mvqheosngn's panel for the reference program."""
+        mvq = getattr(fdk, "mvqheosngn", None)
+        if mvq is None:
+            return None
+        mvq_vup = getattr(mvq, "vupcwzjtxu", None)
+        if mvq_vup is None or not mvq_vup.rzmeklhluf:
+            return None
+        ref = list(mvq_vup.vkuvtkaerv)
+        if len(ref) != num_slots:
+            return None
+        return ref
+
+    def _vp_analytical_program(self, brz, num_slots) -> list | None:
+        """Compute program from (init_pos -> aqszntqeae) analytically."""
+        CSPOIQWER = 4
+
+        aqsz = getattr(brz, "aqszntqeae", None)
+        if aqsz is None:
+            return None
+
+        x0 = brz.fwrnsvyvrz
+        y0 = brz.bmhxacplut
+        rot0 = brz.qixyeojolu
+        scale0 = brz.fpofcohbab
+
+        dx = aqsz.x - x0
+        dy = aqsz.y - y0
+        d_rot = (aqsz.rotation - rot0) % 360
+        d_scale = aqsz.scale - scale0
+
+        if dx % CSPOIQWER != 0 or dy % CSPOIQWER != 0:
+            return None
+
+        program = []
+        if d_rot == 90:    program.append(5)
+        elif d_rot == 180: program.append(7)
+        elif d_rot == 270: program.append(6)
+
+        if d_scale > 0:    program.extend([8] * d_scale)
+        elif d_scale < 0:  program.extend([9] * (-d_scale))
+
+        steps_y = dy // CSPOIQWER
+        steps_x = dx // CSPOIQWER
+        if steps_y > 0:   program.extend([3] * steps_y)
+        elif steps_y < 0: program.extend([33] * (-steps_y))
+        if steps_x > 0:   program.extend([2] * steps_x)
+        elif steps_x < 0: program.extend([1] * (-steps_x))
+
+        while len(program) < num_slots:
+            program.append(0)
+
+        if len(program) > num_slots:
+            return None
+
+        return program
+
+    def _vp_brute_force(self, brz, vup, current_prog, global_deadline) -> list | None:
+        """Brute-force over bit combinations for <=12 bits."""
+        import time
+
+        slots = vup.rzmeklhluf
+        total_bits = sum(len(s.sonocxtjtj) for s in slots)
+        if total_bits > 12:
+            return None
+
+        aqsz = getattr(brz, "aqszntqeae", None)
+        if aqsz is None:
+            return None
+
+        x0 = brz.fwrnsvyvrz
+        y0 = brz.bmhxacplut
+        rot0 = brz.qixyeojolu
+        scale0 = brz.fpofcohbab
+        sjm0 = brz.nzmblccilq
+
+        for combo in range(2 ** total_bits):
+            if time.monotonic() >= global_deadline:
+                return None
+            program = []
+            bit_idx = 0
+            for slot in slots:
+                val = 0
+                for b_i, bit in enumerate(slot.sonocxtjtj):
+                    cur_checked = bit.yliktcpsfp
+                    want_flip = bool(combo & (1 << bit_idx))
+                    if cur_checked ^ want_flip:
+                        val |= (1 << b_i)
+                    bit_idx += 1
+                program.append(val)
+
+            if self._vp_simulate(x0, y0, rot0, scale0, sjm0, program, aqsz):
+                return program
+
+        return None
+
+    @staticmethod
+    def _vp_simulate(x0, y0, rot0, scale0, sjm0, program, aqsz) -> bool:
+        """Simulate program execution and check win (no collision detection)."""
+        CSPOIQWER = 4
+        x, y, rot, scale, sjm = x0, y0, rot0 % 360, scale0, sjm0
+
+        for code in program:
+            if code == 1:    x -= CSPOIQWER
+            elif code == 2:  x += CSPOIQWER
+            elif code == 3:  y += CSPOIQWER
+            elif code == 33: y -= CSPOIQWER
+            elif code == 5:  rot = (rot + 90) % 360
+            elif code == 6:  rot = (rot - 90 + 360) % 360
+            elif code == 7:  rot = (rot + 180) % 360
+            elif code == 8:  scale += 1
+            elif code == 9:  scale = max(1, scale - 1)
+            elif code == 10 or code == 11: x += CSPOIQWER * 2
+            elif code == 12 or code == 13: x -= CSPOIQWER * 2
+            elif code == 16: rot = (rot + 270) % 360
+            elif code == 34: x -= CSPOIQWER
+            elif code == 14: sjm = 9
+            elif code == 15: sjm = 8
+            elif code == 63: sjm = 15
+
+        return (x == aqsz.x and y == aqsz.y and
+                scale == aqsz.scale and rot == aqsz.rotation and
+                sjm == aqsz.sjmtdfxdrc)
+
+    def _vp_compute_toggles(self, vup, current_prog, target_prog) -> list | None:
+        """Compute click positions needed to change current_prog to target_prog."""
+        if len(current_prog) != len(target_prog):
+            return None
+
+        toggle_clicks = []
+        for slot, cur_val, tgt_val in zip(vup.rzmeklhluf, current_prog, target_prog):
+            diff = cur_val ^ tgt_val
+            if diff == 0:
+                continue
+            for b_i, bit in enumerate(slot.sonocxtjtj):
+                if diff & (1 << b_i):
+                    cx = bit.x + bit._width // 2
+                    cy = bit.y + bit._height // 2
+                    toggle_clicks.append({"x": cx, "y": cy})
+
+        return toggle_clicks
