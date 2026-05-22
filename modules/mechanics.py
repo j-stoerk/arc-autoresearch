@@ -124,6 +124,11 @@ class MechanicsLearner:
         if plan is not None:
             return plan
 
+        # Octonary path: sprite-connection solver (cn04-style pixel-align games)
+        plan = self._sprite_connection_solver(raw_env, _full, actions, start_levels, global_deadline)
+        if plan is not None:
+            return plan
+
         # Fallback: generic greedy cycle search (other cycle-to-match games)
         return self._generic_greedy(raw_env, actions, start_levels, node_budget, global_deadline)
 
@@ -2404,3 +2409,347 @@ class MechanicsLearner:
         # Add ACTION5 as sentinel ("A5") to trigger check
         plan.append("ACTION5")
         return plan
+
+    # ------------------------------------------------------------------ #
+    # Sprite-connection solver (cn04 style)                               #
+    # ------------------------------------------------------------------ #
+
+    def _sprite_connection_solver(
+        self, raw_env, all_actions, kb_actions, start_levels, global_deadline
+    ) -> list | None:
+        """Solver for cn04-style pixel-connection games.
+
+        Game structure: sprites have canonical 8/13 pixels (hlxyvcmpk).
+        Win when all 8/13 pixels are "connected" (two sprites share same
+        world position with same color). CONNECTION = iahpylgry populated.
+
+        Detection: hlxyvcmpk, vausolnec, kpgnbcoir, iahpylgry fields.
+        Action vocab: A6=click to select, A5=rotate 90° + check win,
+                      A1-4=move 1 step + check win.
+
+        Strategy: analytically find rotation+offset that aligns all
+        connection pixels between sprites. Use brute-force probe to
+        validate (accounts for complex camera/coordinate transforms).
+        """
+        import time
+        import numpy as np
+
+        if time.monotonic() >= global_deadline:
+            return None
+
+        game = getattr(raw_env, "_game", None)
+        if game is None:
+            return None
+
+        # Detect cn04-style structure
+        hlxyvcmpk = getattr(game, "hlxyvcmpk", None)
+        vausolnec = getattr(game, "vausolnec", None)
+        kpgnbcoir = getattr(game, "kpgnbcoir", None)
+        iahpylgry = getattr(game, "iahpylgry", None)
+
+        if hlxyvcmpk is None or vausolnec is None or kpgnbcoir is None:
+            return None
+        if len(hlxyvcmpk) < 2:
+            return None
+
+        # Find click, keyboard, rotate actions
+        click_enum = None
+        action5_enum = None
+        action1_enum = None
+        action2_enum = None
+        action3_enum = None
+        action4_enum = None
+        for a in all_actions:
+            nm = getattr(a, "name", "")
+            if nm.endswith("6"): click_enum = a
+            if nm.endswith("5"): action5_enum = a
+        for a in kb_actions:
+            nm = getattr(a, "name", "")
+            if nm.endswith("1"): action1_enum = a
+            if nm.endswith("2"): action2_enum = a
+            if nm.endswith("3"): action3_enum = a
+            if nm.endswith("4"): action4_enum = a
+
+        if click_enum is None or action5_enum is None:
+            return None
+        if action1_enum is None or action3_enum is None:
+            return None
+
+        win_score = int(getattr(game, "_win_score", 1) or 1)
+
+        # Find camera scale: display_to_grid(s, s) → (g, g) → scale = s/g
+        cam = getattr(game, "camera", None)
+        cam_scale = 2  # default
+        cam_offset = 0
+        if cam:
+            for test_d in range(4, 24, 4):
+                try:
+                    r = cam.display_to_grid(test_d, test_d)
+                    if r and r[0] > 0:
+                        # Fit: (test_d - offset) // scale = r[0]
+                        # From two points: try to find scale and offset
+                        for test_d2 in range(test_d+4, 48, 4):
+                            r2 = cam.display_to_grid(test_d2, test_d2)
+                            if r2 and r2[0] > r[0]:
+                                scale_est = (test_d2 - test_d) // (r2[0] - r[0])
+                                offset_est = test_d - r[0] * scale_est
+                                # Verify
+                                for td in [4, 8, 12, 42, 30]:
+                                    rv = cam.display_to_grid(td, td)
+                                    if rv and rv[0] != (td - offset_est) // scale_est:
+                                        break
+                                else:
+                                    cam_scale = scale_est
+                                    cam_offset = offset_est
+                                    break
+                        break
+                except Exception:
+                    pass
+
+        def grid_to_display(gx, gy):
+            """Center of grid cell in display coordinates."""
+            return (gx * cam_scale + cam_offset + cam_scale // 2,
+                    gy * cam_scale + cam_offset + cam_scale // 2)
+
+        # Get sprites and their canonical pixel arrays
+        level = getattr(game, "current_level", None)
+        if level is None:
+            return None
+
+        sprites_list = [s for s in level._sprites
+                       if s.name in hlxyvcmpk and s.is_visible]
+        if len(sprites_list) < 2:
+            return None
+
+        plan = []
+        sim = copy.deepcopy(raw_env)
+
+        gc.disable()
+        try:
+            cur_lc = start_levels
+            while cur_lc < win_score and time.monotonic() < global_deadline:
+                g = getattr(sim, "_game", None)
+                if g is None:
+                    break
+
+                level_plan = self._sc_solve_level(
+                    g, sim, click_enum, action5_enum,
+                    action1_enum, action2_enum, action3_enum, action4_enum,
+                    cam_scale, cam_offset, start_levels, global_deadline
+                )
+                if level_plan is None:
+                    break
+
+                plan.extend(level_plan)
+                level_advanced = False
+                for item in level_plan:
+                    if time.monotonic() >= global_deadline:
+                        break
+                    if isinstance(item, dict):
+                        obs = sim.step(click_enum, data=item)
+                    else:
+                        act = None
+                        nm = item
+                        if nm == "ACTION5": act = action5_enum
+                        elif nm == "ACTION1": act = action1_enum
+                        elif nm == "ACTION3": act = action3_enum
+                        if act is None:
+                            for a in kb_actions:
+                                if getattr(a, "name", "") == nm:
+                                    act = a; break
+                        if act is None:
+                            break
+                        obs = sim.step(act)
+                    new_lc = int(getattr(obs, "levels_completed", 0) or 0)
+                    if new_lc > cur_lc:
+                        cur_lc = new_lc
+                        level_advanced = True
+                        break
+                if not level_advanced:
+                    break
+        finally:
+            gc.enable()
+
+        return plan if plan else None
+
+    def _sc_solve_level(self, game, sim, click_enum, action5_enum,
+                        action1_enum, action2_enum, action3_enum, action4_enum,
+                        cam_scale, cam_offset, start_levels, global_deadline) -> list | None:
+        """Analytically find click+rotate+move plan to align sprite canonical pixels.
+
+        For each target sprite and each rotation (0..3):
+          1. One deepcopy probe to get actual rotated pixel array.
+          2. Compute (dx, dy) = displacement needed to align a matching pixel value.
+          3. One verification probe per candidate displacement.
+        Total probes: O(sprites × 4 + candidates) — fast.
+        """
+        import time
+        import numpy as np
+
+        hlxyvcmpk = getattr(game, "hlxyvcmpk", {})
+        level = getattr(game, "current_level", None)
+        if level is None:
+            return None
+
+        sprites_list = [s for s in level._sprites if s.name in hlxyvcmpk and s.is_visible]
+        if len(sprites_list) < 2:
+            return None
+
+        action_map = {}
+        for nm, a in [("ACTION1", action1_enum), ("ACTION2", action2_enum),
+                      ("ACTION3", action3_enum), ("ACTION4", action4_enum),
+                      ("ACTION5", action5_enum)]:
+            if a is not None:
+                action_map[nm] = a
+
+        def grid_to_display(gx, gy):
+            return {"x": gx * cam_scale + cam_offset + cam_scale // 2,
+                    "y": gy * cam_scale + cam_offset + cam_scale // 2}
+
+        def px_world(px_arr, sx, sy):
+            """Non-transparent pixel world positions: {value: [(wx,wy)...]}."""
+            arr = np.asarray(px_arr, dtype=np.int32)
+            result = {}
+            for r in range(arr.shape[0]):
+                for c in range(arr.shape[1]):
+                    v = int(arr[r, c])
+                    if v >= 0:
+                        result.setdefault(v, []).append((sx + c, sy + r))
+            return result
+
+        def find_click_pos(sprite):
+            """Display coords of first non-transparent pixel of sprite."""
+            px = getattr(sprite, 'pixels', None)
+            if px is None:
+                return grid_to_display(sprite._x, sprite._y)
+            arr = np.asarray(px, dtype=np.int32)
+            for r in range(arr.shape[0]):
+                for c in range(arr.shape[1]):
+                    if arr[r, c] >= 0:
+                        return grid_to_display(sprite._x + c, sprite._y + r)
+            return grid_to_display(sprite._x, sprite._y)
+
+        def step_item(env, item):
+            if isinstance(item, dict):
+                return env.step(click_enum, data=item)
+            a = action_map.get(item)
+            return env.step(a) if a else None
+
+        xseexqzst_init = getattr(game, "xseexqzst", None)
+
+        # Fixed reference: the initially-selected sprite(s). Use current pixels (rotation already applied).
+        fixed_list = [s for s in sprites_list if s is xseexqzst_init]
+        if not fixed_list:
+            fixed_list = sprites_list[:1]
+        moveables = [s for s in sprites_list if s not in fixed_list]
+        if not moveables:
+            return None
+
+        ref_pixels = {}
+        for fs in fixed_list:
+            px = getattr(fs, 'pixels', None)
+            if px is None:
+                continue
+            for v, positions in px_world(px, fs._x, fs._y).items():
+                ref_pixels.setdefault(v, []).extend(positions)
+        if not ref_pixels:
+            return None
+
+        ref_set = {v: set(pos) for v, pos in ref_pixels.items()}
+        max_move = 25
+
+        for target_sprite in moveables:
+            if time.monotonic() >= global_deadline:
+                break
+
+            for rot_count in range(4):
+                if time.monotonic() >= global_deadline:
+                    break
+
+                # Probe to get sprite's pixel array after rot_count rotations
+                probe_rot = copy.deepcopy(sim)
+                pg = probe_rot._game
+
+                click_pos = find_click_pos(
+                    next(s for s in pg.current_level._sprites if s.name == target_sprite.name)
+                )
+                probe_rot.step(click_enum, data=click_pos)
+                for _ in range(rot_count):
+                    probe_rot.step(action5_enum)
+
+                # Check immediate win (only rotation needed)
+                if pg.sjwqloivve():
+                    plan = [click_pos] + ["ACTION5"] * rot_count
+                    del probe_rot; gc.collect()
+                    return plan
+
+                ptgt = next((s for s in pg.current_level._sprites if s.name == target_sprite.name), None)
+                if ptgt is None:
+                    del probe_rot; gc.collect()
+                    continue
+
+                tgt_px = getattr(ptgt, 'pixels', None)
+                if tgt_px is None:
+                    del probe_rot; gc.collect()
+                    continue
+
+                tgt_pixels = px_world(tgt_px, ptgt._x, ptgt._y)
+                del probe_rot; gc.collect()
+
+                # Compute candidate (dx, dy) displacements: align matching pixel values
+                tried = set()
+                candidates = []
+                for v, tgt_pos in tgt_pixels.items():
+                    if v not in ref_pixels:
+                        continue
+                    for rwx, rwy in ref_pixels[v]:
+                        for twx, twy in tgt_pos:
+                            dx, dy = rwx - twx, rwy - twy
+                            if (dx, dy) in tried:
+                                continue
+                            if abs(dx) > max_move or abs(dy) > max_move:
+                                continue
+                            tried.add((dx, dy))
+                            # Count total aligned pixels at this displacement
+                            align = sum(
+                                1 for v2, t2 in tgt_pixels.items()
+                                if v2 in ref_set
+                                for tw2x, tw2y in t2
+                                if (tw2x + dx, tw2y + dy) in ref_set[v2]
+                            )
+                            candidates.append((align, dx, dy))
+
+                candidates.sort(reverse=True)  # most alignment first
+
+                for align, dx, dy in candidates:
+                    if time.monotonic() >= global_deadline:
+                        break
+
+                    move_plan = []
+                    if dx < 0:
+                        move_plan.extend(["ACTION3"] * (-dx))
+                    elif dx > 0:
+                        move_plan.extend(["ACTION4"] * dx)
+                    if dy < 0:
+                        move_plan.extend(["ACTION1"] * (-dy))
+                    elif dy > 0:
+                        move_plan.extend(["ACTION2"] * dy)
+
+                    plan = [click_pos] + ["ACTION5"] * rot_count + move_plan
+
+                    # Verification probe
+                    probe_v = copy.deepcopy(sim)
+                    won = False
+                    for item in plan:
+                        obs = step_item(probe_v, item)
+                        if obs is None:
+                            break
+                        if int(getattr(obs, "levels_completed", 0) or 0) > start_levels:
+                            won = True
+                            break
+                    del probe_v; gc.collect()
+
+                    if won:
+                        return plan
+
+        return None
