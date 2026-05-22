@@ -119,6 +119,11 @@ class MechanicsLearner:
         if plan is not None:
             return plan
 
+        # Septenary path: tile-sorting solver (sb26-style drag-and-match games)
+        plan = self._tile_sorting_solver(raw_env, _full, start_levels, global_deadline)
+        if plan is not None:
+            return plan
+
         # Fallback: generic greedy cycle search (other cycle-to-match games)
         return self._generic_greedy(raw_env, actions, start_levels, node_budget, global_deadline)
 
@@ -2230,3 +2235,172 @@ class MechanicsLearner:
                 cur_by = click_y
 
         return clicks if clicks else None
+
+    # ------------------------------------------------------------------ #
+    # Tile-sorting solver (sb26 style)                                    #
+    # ------------------------------------------------------------------ #
+
+    def _tile_sorting_solver(
+        self, raw_env, all_actions, start_levels, global_deadline
+    ) -> list | None:
+        """Solver for sb26-style tile-sorting games.
+
+        Game structure: lngftsryyw tile sprites must be placed into
+        susublrply slot sprites in order matching wcfyiodrx chapter colors.
+        ACTION6 pick+place moves tiles; ACTION5 triggers sequential check.
+
+        Detection: dkouqqads (tile list), dewwplfix (slot list),
+        wcfyiodrx (chapter color sequence), qaagahahj (frame structure).
+        """
+        import time
+
+        if time.monotonic() >= global_deadline:
+            return None
+
+        game = getattr(raw_env, "_game", None)
+        if game is None:
+            return None
+
+        # Detect sb26-style structure
+        wcfyiodrx = getattr(game, "wcfyiodrx", None)
+        dkouqqads = getattr(game, "dkouqqads", None)
+        qaagahahj = getattr(game, "qaagahahj", None)
+
+        if not wcfyiodrx or not dkouqqads or not qaagahahj:
+            return None
+
+        # Find ACTION5 and ACTION6
+        action5_enum = None
+        click_enum = None
+        for a in all_actions:
+            nm = getattr(a, "name", "")
+            if nm.endswith("5"):
+                action5_enum = a
+            elif nm.endswith("6"):
+                click_enum = a
+        if action5_enum is None or click_enum is None:
+            return None
+
+        win_score = int(getattr(game, "_win_score", 1) or 1)
+        plan = []
+        sim = copy.deepcopy(raw_env)
+
+        gc.disable()
+        try:
+            cur_lc = start_levels
+            while cur_lc < win_score and time.monotonic() < global_deadline:
+                g = getattr(sim, "_game", None)
+                if g is None:
+                    break
+
+                level_plan = self._ts_solve_level(g, click_enum, action5_enum, global_deadline)
+                if level_plan is None:
+                    break
+
+                plan.extend(level_plan)
+                level_advanced = False
+                for item in level_plan:
+                    if time.monotonic() >= global_deadline:
+                        break
+                    if isinstance(item, dict):
+                        obs = sim.step(click_enum, data=item)
+                    else:
+                        obs = sim.step(action5_enum)
+                    new_lc = int(getattr(obs, "levels_completed", 0) or 0)
+                    if new_lc > cur_lc:
+                        cur_lc = new_lc
+                        level_advanced = True
+                        break
+                if not level_advanced:
+                    break
+        finally:
+            gc.enable()
+
+        return plan if plan else None
+
+    def _ts_solve_level(self, game, click_enum, action5_enum, global_deadline) -> list | None:
+        """Compute tile placement sequence + ACTION5 for one sb26 level."""
+        import time
+
+        wcfyiodrx = getattr(game, "wcfyiodrx", [])
+        level = getattr(game, "current_level", None)
+        if not wcfyiodrx or level is None:
+            return None
+
+        sprites = getattr(level, "_sprites", [])
+
+        # Tiles: lngftsryyw tagged (visible)
+        tiles = [s for s in sprites
+                 if "lngftsryyw" in str(getattr(s, "tags", [])) and s.is_visible]
+        # Slots: susublrply tagged, at low y (in slot row)
+        all_slots = [s for s in sprites if "susublrply" in str(getattr(s, "tags", []))]
+        # Separate slot-row (high y) from tile-row indicators
+        if not tiles or not all_slots:
+            return None
+
+        # Slots with y <= median_tile_y are in slot area
+        tile_ys = [t._y for t in tiles]
+        median_ty = sum(tile_ys) // len(tile_ys)
+        slots = sorted([s for s in all_slots if s._y < median_ty and s.is_visible],
+                       key=lambda s: s._x)
+
+        if not slots or len(slots) != len(wcfyiodrx):
+            return None
+
+        # Get chapter required colors: wcfyiodrx[i].pixels[0,0]
+        chapter_colors = []
+        for wc in wcfyiodrx:
+            px = getattr(wc, "pixels", None)
+            if px is not None and px.shape[0] > 0 and px.shape[1] > 0:
+                chapter_colors.append(int(px[0, 0]))
+            else:
+                chapter_colors.append(-1)
+
+        # Get tile colors: tile.pixels[height//2, width//2]
+        def tile_center_color(t):
+            px = getattr(t, "pixels", None)
+            if px is None:
+                return -1
+            return int(px[px.shape[0] // 2, px.shape[1] // 2])
+
+        # Match tiles to slots by chapter color
+        unmatched_tiles = list(tiles)
+        assignment = {}  # slot_i -> tile
+        for slot_i, chap_color in enumerate(chapter_colors):
+            for t in unmatched_tiles:
+                if tile_center_color(t) == chap_color:
+                    assignment[slot_i] = t
+                    unmatched_tiles.remove(t)
+                    break
+
+        if len(assignment) != len(wcfyiodrx):
+            return None
+
+        # Build plan: for each slot_i, pick tile then place in slot
+        plan = []
+        for slot_i in range(len(slots)):
+            if slot_i not in assignment or time.monotonic() >= global_deadline:
+                return None
+
+            tile = assignment[slot_i]
+            slot = slots[slot_i]
+
+            # Click center of tile (pick)
+            tx_px = getattr(tile, "pixels", None)
+            tw = tx_px.shape[1] if tx_px is not None else 1
+            th = tx_px.shape[0] if tx_px is not None else 1
+            pick_x = tile._x + tw // 2
+            pick_y = tile._y + th // 2
+            plan.append({"x": pick_x, "y": pick_y})
+
+            # Click center of slot (place)
+            sx_px = getattr(slot, "pixels", None)
+            sw = sx_px.shape[1] if sx_px is not None else 1
+            sh = sx_px.shape[0] if sx_px is not None else 1
+            place_x = slot._x + sw // 2
+            place_y = slot._y + sh // 2
+            plan.append({"x": place_x, "y": place_y})
+
+        # Add ACTION5 as sentinel ("A5") to trigger check
+        plan.append("ACTION5")
+        return plan
