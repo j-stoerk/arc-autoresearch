@@ -134,6 +134,11 @@ class MechanicsLearner:
         if plan is not None:
             return plan
 
+        # Decenary path: checkers-jump solver (lf52-style piece-jumping games)
+        plan = self._checkers_jump_solver(raw_env, _full, start_levels, global_deadline)
+        if plan is not None:
+            return plan
+
         # Fallback: generic greedy cycle search (other cycle-to-match games)
         return self._generic_greedy(raw_env, actions, start_levels, node_budget, global_deadline)
 
@@ -2933,3 +2938,127 @@ class MechanicsLearner:
                     return [{"x": dx1, "y": dy1}, {"x": dx2_sel, "y": dy2_sel}, {"x": dx2, "y": dy2}]
 
         return None
+
+    def _checkers_jump_solver(self, raw_env, all_actions, start_levels, global_deadline) -> list | None:
+        """For games where pieces jump over each other to merge (lf52-style checkers).
+
+        Detection: game has ikhhdzfmarl with posalhhmjq + hncnfaqaddg + ndtvadsrqf.
+        Each move: select piece (click its grid pixel), then click destination pixel.
+        Destination pixel == arrow pixel (arrow at 2-grid-cell offset from piece).
+        BFS on frozenset of piece positions; win when count reaches 1.
+        """
+        import time
+        from collections import deque
+        game = getattr(raw_env, "_game", None)
+        if game is None:
+            return None
+        ikh = getattr(game, "ikhhdzfmarl", None)
+        if ikh is None or not hasattr(ikh, "posalhhmjq") or not hasattr(ikh, "hncnfaqaddg"):
+            return None
+
+        click_enum = None
+        for a in all_actions:
+            if hasattr(a, "name") and "ACTION6" in a.name:
+                click_enum = a
+                break
+        if click_enum is None:
+            return None
+
+        grid = getattr(ikh, "hncnfaqaddg", None)
+        if grid is None or not hasattr(grid, "ndtvadsrqf"):
+            return None
+
+        grid_off = getattr(grid, "cdpcbbnfdp", (0, 0))
+
+        fozw = grid.ndtvadsrqf("fozwvlovdui")
+        if not fozw:
+            return None
+        init_pieces = frozenset(getattr(p, "chahdtpdoz", None) for p in fozw)
+        if not init_pieces or None in init_pieces:
+            return None
+
+        if time.monotonic() >= global_deadline:
+            return None
+
+        # Precompute valid landing positions using game's own collision check
+        floor_positions: set = set()
+        try:
+            for gx in range(-5, 30):
+                for gy in range(-5, 30):
+                    if ikh.posalhhmjq((gx, gy)):
+                        floor_positions.add((gx, gy))
+        except Exception:
+            return None
+
+        if not floor_positions:
+            return None
+
+        DIRS = [(1, 0), (-1, 0), (0, 1), (0, -1)]
+
+        def successors(pieces_set):
+            result = []
+            for px, py in pieces_set:
+                for dx, dy in DIRS:
+                    mid = (px + dx, py + dy)
+                    dst = (px + 2 * dx, py + 2 * dy)
+                    if mid in pieces_set and dst in floor_positions and dst not in pieces_set:
+                        nps = set(pieces_set)
+                        nps.discard((px, py))
+                        nps.add(dst)
+                        nps.discard(mid)
+                        result.append((frozenset(nps), (px, py), dx, dy, dst))
+            return result
+
+        queue: deque = deque([(init_pieces, [])])
+        visited: set = {init_pieces}
+        found = None
+        MAX_NODES = 200000
+
+        nodes = 0
+        while queue and nodes < MAX_NODES:
+            if time.monotonic() >= global_deadline:
+                return None
+            state, plan = queue.popleft()
+            nodes += 1
+            for new_state, frm, dx, dy, dst in successors(state):
+                new_plan = plan + [(frm, dx, dy, dst)]
+                if len(new_state) == 1:
+                    found = new_plan
+                    break
+                if new_state not in visited:
+                    visited.add(new_state)
+                    queue.append((new_state, new_plan))
+            if found:
+                break
+
+        if found is None:
+            return None
+
+        # Convert to clicks: piece pixel = (gx*6+off_x, gy*6+off_y)
+        # Destination pixel = (dst_x*6+off_x, dst_y*6+off_y)
+        # (arrow sits at destination grid position because arrow offset = 2*dir*6)
+        ox, oy = int(grid_off[0]), int(grid_off[1])
+        plan_clicks = []
+        for (gx, gy), dx, dy, (dst_x, dst_y) in found:
+            plan_clicks.append({"x": gx * 6 + ox, "y": gy * 6 + oy})
+            plan_clicks.append({"x": dst_x * 6 + ox, "y": dst_y * 6 + oy})
+
+        # Probe to verify and detect early win
+        probe = copy.deepcopy(raw_env)
+        gc.disable()
+        try:
+            for i, click_data in enumerate(plan_clicks):
+                ob = probe.step(click_enum, data=click_data)
+                lc = int(getattr(ob, "levels_completed", 0) or 0)
+                if lc > start_levels:
+                    del probe
+                    gc.enable()
+                    gc.collect()
+                    return plan_clicks[: i + 1]
+            won = int(getattr(ob, "levels_completed", 0) or 0) > start_levels
+        finally:
+            gc.enable()
+        del probe
+        gc.collect()
+
+        return plan_clicks if won else None
