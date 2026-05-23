@@ -60,3 +60,4 @@ a04233b	0.741538	8.3	keep	visual_program_solver: tn36 solved via bit-toggle+run 
 764b2b0	0.803077	8.7	keep	ball_placement_solver: su15 solved via click-to-move mechanic (pkrdtzfrth moves ball toward click by ikskfqldi=4 px/frame; 10 diagonal clicks move ball from (3,58) to zone (44,11)); object-centric state/action discovery; 16.1s cached
 a4829c6	0.852308	9.1	keep	tile_sorting_solver: sb26 solved via pick-and-place tiles to match chapter colors; A5 triggers sequential check; 9 actions/level; ACTION5 hidden vocabulary; 16.9s cached
 HEAD	0.864615	9.6	keep	sprite_connection_solver: cn04 solved via click sprite2+rotate 1×A5+left 10×A3+up 1×A1; analytical pixel-alignment (O(sprites×4) probes); 13.8s cached
+a288f80	0.904615	9.7	keep	ball_routing_solver: r11l solved via checkpoint-centroid analytical search (sort candidate sums by distance from target; 3-click plan); 15.1s cached
