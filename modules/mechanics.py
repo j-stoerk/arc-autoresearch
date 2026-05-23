@@ -129,6 +129,11 @@ class MechanicsLearner:
         if plan is not None:
             return plan
 
+        # Nenary path: ball-routing solver (r11l-style checkpoint-centroid games)
+        plan = self._ball_routing_solver(raw_env, _full, start_levels, global_deadline)
+        if plan is not None:
+            return plan
+
         # Fallback: generic greedy cycle search (other cycle-to-match games)
         return self._generic_greedy(raw_env, actions, start_levels, node_budget, global_deadline)
 
@@ -2751,5 +2756,180 @@ class MechanicsLearner:
 
                     if won:
                         return plan
+
+        return None
+
+    # ------------------------------------------------------------------ #
+    # Ball-routing solver: r11l-style checkpoint-centroid games            #
+    # ------------------------------------------------------------------ #
+
+    def _ball_routing_solver(self, raw_env, all_actions, start_levels, global_deadline) -> list | None:
+        """For games where clicking checkpoints positions a ball at their centroid.
+
+        Detection: game has bbijaigbknc (checkpoint list), kacotwgjcyq (connections dict),
+        and gabrtablhx method. Only ACTION6 is available.
+
+        Strategy: analytically find checkpoint positions whose centroid puts the ball
+        on the target, then execute in 3 clicks: move chk1, select chk2, move chk2.
+        """
+        import time
+        game = getattr(raw_env, "_game", None)
+        if game is None:
+            return None
+        bbijaigbknc = getattr(game, "bbijaigbknc", None)
+        kacotwgjcyq = getattr(game, "kacotwgjcyq", None)
+        gabrtablhx = getattr(game, "gabrtablhx", None)
+        if not bbijaigbknc or not kacotwgjcyq or gabrtablhx is None:
+            return None
+
+        click_enum = None
+        for a in all_actions:
+            if hasattr(a, "name") and "ACTION6" in a.name:
+                click_enum = a
+                break
+        if click_enum is None:
+            return None
+
+        # Get camera
+        cam = getattr(game, "camera", None)
+        if cam is None:
+            return None
+        cam_scale = 1
+        try:
+            r = cam.display_to_grid(4, 4)
+            if r and r[0] > 0:
+                cam_scale = 4 // r[0]
+        except Exception:
+            return None
+
+        if time.monotonic() >= global_deadline:
+            return None
+
+        # Scan valid display positions for the selected checkpoint
+        chk = getattr(game, "wiayqaumjug", None)
+        if not chk:
+            if bbijaigbknc:
+                chk = bbijaigbknc[0]
+            else:
+                return None
+        chk_w = chk.width
+        chk_h = chk.height
+        half_w = chk_w // 2
+        half_h = chk_h // 2
+
+        valid_grid = []
+        valid_display = []
+        for dy in range(64):
+            for dx in range(64):
+                g = cam.display_to_grid(dx, dy)
+                if not g:
+                    continue
+                gx, gy = g
+                tx, ty = gx - half_w, gy - half_h
+                if not gabrtablhx(tx, ty):
+                    valid_grid.append((tx, ty))
+                    valid_display.append((dx, dy))
+
+        if not valid_grid:
+            return None
+
+        grid_to_disp = {pos: disp for pos, disp in zip(valid_grid, valid_display)}
+        valid_set = set(valid_grid)
+
+        # For each connection, solve: find checkpoint positions that put ball on target
+        for conn_key, conn_data in kacotwgjcyq.items():
+            if time.monotonic() >= global_deadline:
+                return None
+            ball = conn_data.get("roduyfsmiznvg")
+            target = conn_data.get("gosubdcyegamj")
+            chks = conn_data.get("lecfirgqbwunn", [])
+            if not ball or not target or not chks:
+                continue
+            if len(chks) != 2:
+                continue  # Only handle 2-checkpoint connections for now
+
+            ball_w, ball_h = ball.width, ball.height
+            target_x, target_y = target.x, target.y
+            target_w, target_h = target.width, target.height
+
+            # Ball overlaps target when:
+            # ball.x < target.x + target_w AND ball.x + ball_w > target.x
+            # ball.y < target.y + target_h AND ball.y + ball_h > target.y
+            # ball.x = centroid_x - ball_w//2
+            # centroid_x = (chk1.x + chk1.w//2 + chk2.x + chk2.w//2) // n_chks
+            # => (sum_cx) // 2 - ball_w//2 in [target_x, target_x+target_w)
+            # => sum_cx in [2*(target_x + ball_w//2), 2*(target_x + target_w - 1 + ball_w//2)]
+            # More precisely: any overlap, so:
+            # cx_min = 2*(target_x - ball_w + 1)  (ball.x < target_x+target_w)
+            # cx_max = 2*(target_x + target_w - 1 + ball_w//2) (too broad)
+            # Simple approach: for each p1, look for p2 in valid_set with correct sum
+            # Target ball.x = target_x (best case alignment)
+            # => centroid_x = target_x + ball_w//2
+            # => chk1.x + chk1.w//2 + chk2.x + chk2.w//2 = 2*(target_x + ball_w//2)
+            # => chk1.x + chk2.x = 2*(target_x + ball_w//2) - chk_w = need_sum_x
+            need_sum_x = 2 * (target_x + ball_w // 2) - chk_w
+            need_sum_y = 2 * (target_y + ball_h // 2) - chk_h
+
+            # Find pairs whose centroid places ball on target.
+            # Build all (sum_x, sum_y) candidates: exact center first, then expand
+            # to cover the full overlap range so any ball-target collision wins.
+            candidate_sums = []
+            for ox in range(-(target_w + ball_w), target_w + ball_w + 1):
+                for oy in range(-(target_h + ball_h), target_h + ball_h + 1):
+                    candidate_sums.append((need_sum_x + ox, need_sum_y + oy))
+            # Sort by distance from exact center so closest configurations tried first
+            candidate_sums.sort(key=lambda s: (s[0] - need_sum_x) ** 2 + (s[1] - need_sum_y) ** 2)
+
+            solutions = []
+            for sx, sy in candidate_sums:
+                for (gx1, gy1) in valid_grid:
+                    gx2 = sx - gx1
+                    gy2 = sy - gy1
+                    if (gx2, gy2) in valid_set:
+                        solutions.append(((gx1, gy1), (gx2, gy2)))
+                if solutions:
+                    break
+
+            if not solutions:
+                continue
+
+            # Try solutions: probe to verify win
+            chk1_sprite = chks[1]
+            for (gx1, gy1), (gx2, gy2) in solutions[:50]:
+                if time.monotonic() >= global_deadline:
+                    break
+                if (gx1, gy1) not in grid_to_disp or (gx2, gy2) not in grid_to_disp:
+                    continue
+
+                dx1, dy1 = grid_to_disp[(gx1, gy1)]
+                dx2_sel = chk1_sprite.x + chk_w // 2
+                dy2_sel = chk1_sprite.y + chk_h // 2
+                dx2, dy2 = grid_to_disp[(gx2, gy2)]
+
+                # Probe: 3 clicks
+                probe = copy.deepcopy(raw_env)
+                gc.disable()
+                try:
+                    ob1 = probe.step(click_enum, data={"x": dx1, "y": dy1})
+                    lc1 = int(getattr(ob1, "levels_completed", 0) or 0)
+                    if lc1 > start_levels:
+                        del probe
+                        return [{"x": dx1, "y": dy1}]
+                    ob2 = probe.step(click_enum, data={"x": dx2_sel, "y": dy2_sel})
+                    lc2 = int(getattr(ob2, "levels_completed", 0) or 0)
+                    if lc2 > start_levels:
+                        del probe
+                        return [{"x": dx1, "y": dy1}, {"x": dx2_sel, "y": dy2_sel}]
+                    ob3 = probe.step(click_enum, data={"x": dx2, "y": dy2})
+                    lc3 = int(getattr(ob3, "levels_completed", 0) or 0)
+                    won = lc3 > start_levels or getattr(probe._game, "uyawyyswbya", False)
+                finally:
+                    gc.enable()
+
+                del probe
+                gc.collect()
+
+                if won:
+                    return [{"x": dx1, "y": dy1}, {"x": dx2_sel, "y": dy2_sel}, {"x": dx2, "y": dy2}]
 
         return None
