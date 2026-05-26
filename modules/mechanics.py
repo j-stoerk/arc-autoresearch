@@ -144,6 +144,11 @@ class MechanicsLearner:
         if plan is not None:
             return plan
 
+        # Duodenary path: inverted-gravity platformer solver (bp35-style spring-hop games)
+        plan = self._inverted_platformer_solver(raw_env, _full, start_levels, global_deadline)
+        if plan is not None:
+            return plan
+
         # Fallback: generic greedy cycle search (other cycle-to-match games)
         return self._generic_greedy(raw_env, actions, start_levels, node_budget, global_deadline)
 
@@ -3148,4 +3153,175 @@ class MechanicsLearner:
         finally:
             gc.enable()
         gc.collect()
+        return found
+
+    def _inverted_platformer_solver(self, raw_env, all_actions, start_levels, global_deadline) -> list | None:
+        """Inverted-gravity platformer solver (bp35-style spring-hop games).
+
+        Detection: oztjzzyqoek.vivnprldht=True + springs (qclfkhjnaac) + goal (fjlzdjxhant).
+        Player falls UPWARD. Springs block horizontal movement but can be clicked to remove
+        them (even if not directly above player). Clicking spring directly above (y-1) launches
+        player upward past subsequent springs/walls to next stable position.
+        Returns mixed plan: str (keyboard) | dict (click screen coords).
+        """
+        import time
+        from collections import deque
+        game = getattr(raw_env, "_game", None)
+        if game is None:
+            return None
+        oz = getattr(game, "oztjzzyqoek", None)
+        if oz is None:
+            return None
+        if not getattr(oz, "vivnprldht", False):
+            return None
+
+        by_name = {getattr(a, "name", ""): a for a in all_actions}
+        if "ACTION3" not in by_name or "ACTION4" not in by_name or "ACTION6" not in by_name:
+            return None
+
+        # Parse grid: build type map and find initial springs + goal
+        hd = oz.hdnrlfmyrj
+        gm = getattr(hd, "muocdhlsktl", None)
+        if gm is None:
+            return None
+
+        WALL, SPRING, GOAL, SPIKE, PASS = 0, 1, 2, 3, 4
+
+        _type_cache: dict = {}
+
+        def cell_type(x, y):
+            key = (x, y)
+            if key in _type_cache:
+                return _type_cache[key]
+            elems = gm.get(key)
+            if elems is None:
+                t = PASS
+            elif not isinstance(elems, list) or not elems:
+                t = PASS
+            else:
+                name = getattr(elems[0], "name", "")
+                if name == "xcjjwqfzjfe":
+                    t = WALL
+                elif name == "qclfkhjnaac":
+                    t = SPRING
+                elif name == "fjlzdjxhant":
+                    t = GOAL
+                elif name in ("ubhhgljbnpu", "hzusueifitk"):
+                    t = SPIKE
+                elif name in ("oonshderxef", "aknlbboysnc", "player_right", "player_left",
+                               "player_right_0", "player_left_0"):
+                    t = PASS
+                else:
+                    t = WALL  # unknown → treat as wall
+            _type_cache[key] = t
+            return t
+
+        all_springs: frozenset = frozenset(
+            pos for pos, elems in gm.items()
+            if isinstance(elems, list) and any(getattr(e, "name", "") == "qclfkhjnaac" for e in elems)
+        )
+        goal_pos = next(
+            (pos for pos, elems in gm.items()
+             if isinstance(elems, list) and any(getattr(e, "name", "") == "fjlzdjxhant" for e in elems)),
+            None,
+        )
+        if goal_pos is None or not all_springs:
+            return None
+
+        start_pos = tuple(oz.twdpowducb.qumspquyus)
+
+        def fall_pos(x, y, removed):
+            """Fall upward from (x,y); return (land_y, win, lose)."""
+            cy = y
+            while True:
+                ny = cy - 1
+                ct = cell_type(x, ny)
+                if ct == GOAL:
+                    return ny, True, False
+                if ct == WALL:
+                    return cy, False, False
+                if ct == SPIKE:
+                    return cy, False, True
+                if ct == SPRING and (x, ny) not in removed:
+                    return cy, False, False
+                if ny < -10:  # safety
+                    return cy, False, False
+                cy = ny
+
+        def apply_move(px, py, dx, removed):
+            """A3 (dx=-1) or A4 (dx=+1). Returns (nx, ny, win, lose)."""
+            tx = px + dx
+            if tx < 0:
+                return px, py, False, False
+            ct = cell_type(tx, py)
+            if ct == GOAL:
+                return tx, py, True, False
+            if ct == WALL or (ct == SPRING and (tx, py) not in removed):
+                return px, py, False, False  # blocked (bump)
+            # Passable: apply gravity
+            land_y, win, lose = fall_pos(tx, py, removed)
+            return tx, land_y, win, lose
+
+        def cam_y(py):
+            return py * 6 - 36
+
+        # BFS: state = (player_x, player_y, frozenset_removed_springs)
+        init_state = (start_pos[0], start_pos[1], frozenset())
+        queue = deque([(init_state, [])])
+        visited: set = {init_state}
+        found = None
+        MAX_NODES = 20000
+
+        while queue and found is None:
+            if time.monotonic() >= global_deadline:
+                return None
+            if len(visited) > MAX_NODES:
+                return None
+            state, plan = queue.popleft()
+            px, py, removed = state
+
+            # Try A3, A4
+            for label, dx in (("ACTION3", -1), ("ACTION4", 1)):
+                nx, ny, win, lose = apply_move(px, py, dx, removed)
+                if lose:
+                    continue
+                if win:
+                    found = plan + [label]
+                    break
+                new_state = (nx, ny, removed)
+                if new_state not in visited:
+                    visited.add(new_state)
+                    queue.append((new_state, plan + [label]))
+            if found:
+                break
+
+            # Try clicking springs that directly affect player:
+            # (a) spring directly above (py-1) → launch
+            # (b) spring at px±1 (horizontal blocker) → removal opens path
+            cur_springs = all_springs - removed
+            for (gx, gy) in cur_springs:
+                is_above = (gx == px and gy == py - 1)
+                is_h_block = (gy == py and abs(gx - px) == 1)
+                if not (is_above or is_h_block):
+                    continue
+                new_removed = removed | {(gx, gy)}
+                screen_y_base = cam_y(py)
+                click_d = {"x": gx * 6, "y": gy * 6 - screen_y_base}
+                if is_above:
+                    land_y, win, lose = fall_pos(gx, gy, new_removed)
+                    if lose:
+                        continue
+                    if win:
+                        found = plan + [click_d]
+                        break
+                    new_state = (gx, land_y, new_removed)
+                else:
+                    # Horizontal blocker removed; player stays put
+                    new_state = (px, py, new_removed)
+                if new_state not in visited:
+                    visited.add(new_state)
+                    queue.append((new_state, plan + [click_d]))
+            if found:
+                break
+
         return found

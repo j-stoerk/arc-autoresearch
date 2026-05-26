@@ -62,4 +62,5 @@ a4829c6	0.852308	9.1	keep	tile_sorting_solver: sb26 solved via pick-and-place ti
 HEAD	0.864615	9.6	keep	sprite_connection_solver: cn04 solved via click sprite2+rotate 1×A5+left 10×A3+up 1×A1; analytical pixel-alignment (O(sprites×4) probes); 13.8s cached
 a288f80	0.904615	9.7	keep	ball_routing_solver: r11l solved via checkpoint-centroid analytical search (sort candidate sums by distance from target; 3-click plan); 15.1s cached
 8af178a	0.932308	10.0	keep	checkers_jump_solver: lf52 solved via 4-jump analytical BFS (8 clicks vs 32 human); perfect RHAE; 12.3s cached
-HEAD	0.953846	10.7	keep	undoing_maze_solver: g50t solved via ghost-aware BFS (UNDO creates ghost clone; state key includes ghost positions+moves; 17 steps vs 78 human); 61.6s first run (cached)
+a...	0.953846	10.7	keep	undoing_maze_solver: g50t solved via ghost-aware BFS (UNDO creates ghost clone; state key includes ghost positions+moves; 17 steps vs 78 human); 61.6s first run (cached)
+HEAD	0.960000	11.3	keep	inverted_platformer_solver: bp35 solved via spring-hop analytical BFS (remove blocking spring + launch; 15 actions vs 21 human); <1ms cached
