@@ -139,6 +139,11 @@ class MechanicsLearner:
         if plan is not None:
             return plan
 
+        # Undecenary path: undoing maze solver (g50t-style ghost mechanic games)
+        plan = self._undoing_maze_solver(raw_env, _full, start_levels, global_deadline)
+        if plan is not None:
+            return plan
+
         # Fallback: generic greedy cycle search (other cycle-to-match games)
         return self._generic_greedy(raw_env, actions, start_levels, node_budget, global_deadline)
 
@@ -3062,3 +3067,85 @@ class MechanicsLearner:
         gc.collect()
 
         return plan_clicks if won else None
+
+    def _undoing_maze_solver(self, raw_env, all_actions, start_levels, global_deadline) -> list | None:
+        """For maze games with UNDO mechanic that creates ghost player copies (g50t-style).
+
+        Detection: game has vgwycxsxjz with safkknjslo + dzxunlkwxt + whftgckbcu.
+        The UNDO action (A5/pmlawcgvcp) teleports player to start and creates a ghost
+        that replays past moves — ghost state must be included in BFS state key.
+        Returns list of action name strings (e.g. ["ACTION4", "ACTION2", ...]).
+        """
+        import time
+        from collections import deque
+        game = getattr(raw_env, "_game", None)
+        if game is None:
+            return None
+        vgw = getattr(game, "vgwycxsxjz", None)
+        if vgw is None:
+            return None
+        if not (hasattr(vgw, "safkknjslo") and hasattr(vgw, "dzxunlkwxt") and hasattr(vgw, "whftgckbcu")):
+            return None
+        if not hasattr(game, "hctlyapjnq"):
+            return None
+
+        by_name = {getattr(a, "name", ""): a for a in all_actions}
+        action_pairs = [(name, by_name[name]) for name in ("ACTION1", "ACTION2", "ACTION3", "ACTION4", "ACTION5") if name in by_name]
+        if not action_pairs:
+            return None
+
+        def ghost_state_key(env_copy):
+            g = env_copy._game
+            v = getattr(g, "vgwycxsxjz", None)
+            if v is None:
+                return None
+            player_pos = (v.dzxunlkwxt.x, v.dzxunlkwxt.y)
+            timer_x = getattr(getattr(g, "twyixucrqi", None), "_x", 0)
+            ghost_info = tuple(sorted(
+                (ghost.x, ghost.y, tuple(moves)) for ghost, moves in v.rloltuowth.items()
+            ))
+            return (player_pos, timer_x, ghost_info)
+
+        def check_win(env_copy):
+            v = getattr(getattr(env_copy, "_game", None), "vgwycxsxjz", None)
+            return bool(v and v.safkknjslo)
+
+        init_sk = ghost_state_key(raw_env)
+        if init_sk is None:
+            return None
+
+        queue: deque = deque([(copy.deepcopy(raw_env), [])])
+        visited: set = {init_sk}
+        found = None
+        nodes = 0
+        MAX_NODES = 5000
+        gc.disable()
+        try:
+            while queue and nodes < MAX_NODES:
+                if time.monotonic() >= global_deadline:
+                    return None
+                env_cur, plan = queue.popleft()
+                nodes += 1
+                for label, ga in action_pairs:
+                    en = copy.deepcopy(env_cur)
+                    ob = en.step(ga)
+                    lc = int(getattr(ob, "levels_completed", 0) or 0)
+                    if lc > start_levels or check_win(en):
+                        found = plan + [label]
+                        break
+                    if getattr(en._game, "hctlyapjnq", False):
+                        del en
+                        continue
+                    sk = ghost_state_key(en)
+                    if sk is None or sk not in visited:
+                        if sk:
+                            visited.add(sk)
+                        queue.append((en, plan + [label]))
+                    else:
+                        del en
+                if found:
+                    break
+        finally:
+            gc.enable()
+        gc.collect()
+        return found
