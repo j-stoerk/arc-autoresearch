@@ -149,6 +149,16 @@ class MechanicsLearner:
         if plan is not None:
             return plan
 
+        # Tredecenary path: nested container solver (ka59-style push-through-wall games)
+        plan = self._nested_container_solver(raw_env, _full, start_levels, global_deadline)
+        if plan is not None:
+            return plan
+
+        # Quattuordenary path: cursor maze solver (dc22-style navigate-to-target games)
+        plan = self._cursor_maze_solver(raw_env, _full, start_levels, global_deadline)
+        if plan is not None:
+            return plan
+
         # Fallback: generic greedy cycle search (other cycle-to-match games)
         return self._generic_greedy(raw_env, actions, start_levels, node_budget, global_deadline)
 
@@ -3324,4 +3334,1023 @@ class MechanicsLearner:
             if found:
                 break
 
+        return found
+
+    # ------------------------------------------------------------------ #
+    # Nested-container solver: ka59-style push-through-wall games          #
+    # ------------------------------------------------------------------ #
+
+    def _nested_container_solver(self, raw_env, all_actions, start_levels, global_deadline) -> list | None:
+        """For ka59-style nested container games with push-through-wall mechanic.
+
+        Detection: game has prkgpeyexo (selected container), sprites tagged
+        '0022vrxelxosfy' (containers) and '0010xzmuziohuf' (targets).
+
+        Strategy: analytical BFS using a precomputed passable map and push model.
+        No deepcopy during BFS — state is a pure Python tuple. Deepcopy only used
+        once (initial copy) and for level transitions (at most 7 times total).
+
+        Physics model:
+          - Normal move: container moves step=3 if passable (no boundary/wall) and
+            no other container occupies new position.
+          - Push: if new position == another container, that container is pushed
+            5 × step = 15 px in the same direction, checking boundary ONLY (not wall).
+            Pushing container stays put.
+          - Click: changes the active container (display coords = game_pos + padding).
+
+        Win: all target goal positions (target.x+1, target.y+1) are in container set.
+        Multi-level: after each level BFS, simulate plan on a deepcopy to advance.
+        """
+        import time
+        from collections import deque
+
+        if time.monotonic() >= global_deadline:
+            return None
+
+        game = getattr(raw_env, "_game", None)
+        if game is None or not hasattr(game, "prkgpeyexo"):
+            return None
+
+        level = getattr(game, "current_level", None)
+        if level is None or not hasattr(level, "get_sprites_by_tag"):
+            return None
+        if not level.get_sprites_by_tag("0022vrxelxosfy"):
+            return None
+        if not level.get_sprites_by_tag("0010xzmuziohuf"):
+            return None
+
+        try:
+            from arcengine.enums import GameAction as _GameAction
+            a6 = _GameAction.ACTION6
+        except ImportError:
+            return None
+
+        kb_enum = {
+            "ACTION1": _GameAction.ACTION1, "ACTION2": _GameAction.ACTION2,
+            "ACTION3": _GameAction.ACTION3, "ACTION4": _GameAction.ACTION4,
+        }
+        STEP = 3
+        PUSH_FRAMES = 5
+        DIRS = [("ACTION1", 0, -STEP), ("ACTION2", 0, STEP),
+                ("ACTION3", -STEP, 0), ("ACTION4", STEP, 0)]
+
+        def _build_level_model(g):
+            lvl = g.current_level
+            bnd_sprites = [s for s in lvl.get_sprites() if "0029ifoxxfvvvs" in s.tags]
+            if not bnd_sprites:
+                return None
+            bnd = bnd_sprites[0]
+            bnd_pix = bnd.render()
+            bx0, by0, bw, bh = bnd.x, bnd.y, bnd.width, bnd.height
+
+            wall_sprites = [s for s in lvl.get_sprites() if "0015qniapgwsvb" in s.tags]
+            if wall_sprites:
+                wl = wall_sprites[0]; wl_pix = wl.render()
+                wx0, wy0, ww, wh = wl.x, wl.y, wl.width, wl.height
+            else:
+                wl_pix = None; wx0 = wy0 = ww = wh = 0
+
+            def _bnd_blocked(px, py, sw, sh):
+                for dy in range(sh):
+                    for dx in range(sw):
+                        r, c = py + dy - by0, px + dx - bx0
+                        if 0 <= c < bw and 0 <= r < bh and bnd_pix[r, c] >= 0:
+                            return True
+                return False
+
+            def _wall_blocked(px, py, sw, sh):
+                if wl_pix is None:
+                    return False
+                for dy in range(sh):
+                    for dx in range(sw):
+                        r, c = py + dy - wy0, px + dx - wx0
+                        if 0 <= c < ww and 0 <= r < wh and wl_pix[r, c] >= 0:
+                            return True
+                return False
+
+            containers = lvl.get_sprites_by_tag("0022vrxelxosfy")
+            balls = lvl.get_sprites_by_tag("0001uqqokjrptk")
+            n_containers = len(containers)
+            # All pushable objects: containers (selectable) first, then balls (push-only)
+            all_objects = containers + balls
+            n = len(all_objects)
+            c_sizes = [(s.width, s.height) for s in all_objects]
+
+            # Pixel-level collision: get solid pixel offsets for each object.
+            # The game uses collides_with() which checks non-transparent pixel overlap.
+            # Transparent pixels (value < 0) do not participate in collision.
+            obj_solid_offsets: list = []  # list of lists of (dx,dy) tuples
+            obj_has_transparent: list = []
+            for s in all_objects:
+                try:
+                    pix = s.pixels
+                    h_s, w_s = len(pix), len(pix[0])
+                    solid = [(dx, dy) for dy in range(h_s)
+                             for dx in range(w_s) if pix[dy][dx] >= 0]
+                    has_t = len(solid) < h_s * w_s
+                except Exception:
+                    h_s, w_s = s.height, s.width
+                    solid = [(dx, dy) for dy in range(h_s) for dx in range(w_s)]
+                    has_t = False
+                obj_solid_offsets.append(solid)
+                obj_has_transparent.append(has_t)
+
+            def sprites_collide(ax, ay, i, bx, by, j):
+                """Pixel-level collision check. Uses bounding box fast path for solid sprites."""
+                wi, hi = c_sizes[i]; wj, hj = c_sizes[j]
+                # Quick bounding-box rejection
+                if ax >= bx + wj or ax + wi <= bx or ay >= by + hj or ay + hi <= by:
+                    return False
+                # If both sprites are fully solid, bounding-box overlap = pixel overlap
+                if not obj_has_transparent[i] and not obj_has_transparent[j]:
+                    return True
+                # Pixel-level check for sprites with transparent regions
+                x0 = max(ax, bx); x1 = min(ax + wi, bx + wj)
+                y0 = max(ay, by); y1 = min(ay + hi, by + hj)
+                sj_in_region = set()
+                for dx, dy in obj_solid_offsets[j]:
+                    px2, py2 = bx + dx, by + dy
+                    if x0 <= px2 < x1 and y0 <= py2 < y1:
+                        sj_in_region.add((px2, py2))
+                if not sj_in_region:
+                    return False
+                for dx, dy in obj_solid_offsets[i]:
+                    if (ax + dx, ay + dy) in sj_in_region:
+                        return True
+                return False
+
+            # Pixel-aware boundary/wall checks using actual solid pixels
+            def _bnd_blocked_obj(px, py, i):
+                for dx, dy in obj_solid_offsets[i]:
+                    r, c = py + dy - by0, px + dx - bx0
+                    if 0 <= c < bw and 0 <= r < bh and bnd_pix[r, c] >= 0:
+                        return True
+                return False
+
+            def _wall_blocked_obj(px, py, i):
+                if wl_pix is None:
+                    return False
+                for dx, dy in obj_solid_offsets[i]:
+                    r, c = py + dy - wy0, px + dx - wx0
+                    if 0 <= c < ww and 0 <= r < wh and wl_pix[r, c] >= 0:
+                        return True
+                return False
+
+            # Precompute passable sets per object index using pixel-aware boundary check
+            passable_for_obj: list = []
+            push_pass_for_obj: list = []
+            for _oi in range(n):
+                passable_for_obj.append(frozenset(
+                    (px, py)
+                    for py in range(-6, 70, STEP)
+                    for px in range(-6, 70, STEP)
+                    if not _bnd_blocked_obj(px, py, _oi) and not _wall_blocked_obj(px, py, _oi)
+                ))
+                push_pass_for_obj.append(frozenset(
+                    (px, py)
+                    for py in range(-6, 70, STEP)
+                    for px in range(-6, 70, STEP)
+                    if not _bnd_blocked_obj(px, py, _oi)
+                ))
+
+            # (w,h)-keyed backward-compat dicts: use first object of each size
+            passable_for: dict = {}
+            push_pass_for: dict = {}
+            for _oi in range(n):
+                key = c_sizes[_oi]
+                if key not in passable_for:
+                    passable_for[key] = passable_for_obj[_oi]
+                    push_pass_for[key] = push_pass_for_obj[_oi]
+
+            def push_result(ox, oy, obj_idx, pdx, pdy):
+                # Slides until boundary hit OR (frame >= PUSH_FRAMES AND not in wall)
+                x, y = ox, oy
+                pp = push_pass_for_obj[obj_idx]
+                for frame in range(50):
+                    if frame >= PUSH_FRAMES and not _wall_blocked_obj(x, y, obj_idx):
+                        break
+                    tx, ty = x + pdx, y + pdy
+                    if (tx, ty) not in pp:
+                        break
+                    x, y = tx, ty
+                return (x, y)
+
+            def bbox_overlap(ax, ay, aw, ah, bx, by, bw_, bh_):
+                return (ax < bx + bw_ and ax + aw > bx and
+                        ay < by + bh_ and ay + ah > by)
+
+            # Goals for containers and balls (unified)
+            c_targets = lvl.get_sprites_by_tag("0010xzmuziohuf")
+            b_targets = lvl.get_sprites_by_tag("0027jbgxilrocf")
+            c_target_info = [((t.x + 1, t.y + 1), (t.width - 2, t.height - 2)) for t in c_targets]
+            b_target_info = [((t.x + 1, t.y + 1), (t.width - 2, t.height - 2)) for t in b_targets]
+            all_target_goals = c_target_info + b_target_info
+
+            def is_win(positions):
+                remaining = list(all_target_goals)
+                for i, pos in enumerate(positions):
+                    csize = c_sizes[i]
+                    for k, (g_pos, g_size) in enumerate(remaining):
+                        if pos == g_pos and csize == g_size:
+                            remaining.pop(k)
+                            break
+                return len(remaining) == 0
+
+            # Greedy goal assignment for each object (for heuristic/sequential solver)
+            def _assign_goals(obj_list, target_info_list, start_idx):
+                unassigned = list(target_info_list)
+                goals = [None] * len(obj_list)
+                for rel_i in sorted(range(len(obj_list)),
+                                    key=lambda k: len(passable_for_obj[start_idx + k])):
+                    best = None; best_dist = float("inf")
+                    ix, iy = obj_list[rel_i].x, obj_list[rel_i].y
+                    for k, (g_pos, g_size) in enumerate(unassigned):
+                        if g_size == c_sizes[start_idx + rel_i]:
+                            d = abs(g_pos[0] - ix) + abs(g_pos[1] - iy)
+                            if d < best_dist:
+                                best_dist = d; best = k
+                    if best is not None:
+                        goals[rel_i] = unassigned[best][0]
+                        unassigned.pop(best)
+                return goals
+
+            c_goals = _assign_goals(containers, c_target_info, 0)
+            b_goals = _assign_goals(balls, b_target_info, n_containers)
+            object_goals = c_goals + b_goals
+
+            cam = g.camera
+            cam_w = getattr(cam, "width", 45)
+            sc = 64 // cam_w if cam_w > 0 else 1
+            pad = max(0, (64 - cam_w * sc) // 2)
+
+            active_sprite = g.prkgpeyexo
+            active_idx = next((i for i, s in enumerate(containers) if s is active_sprite), 0)
+            init_positions = tuple((s.x, s.y) for s in all_objects)
+
+            return {
+                "n": n, "n_containers": n_containers,
+                "c_sizes": c_sizes, "passable_for": passable_for,
+                "push_pass_for": push_pass_for,
+                "passable_for_obj": passable_for_obj,
+                "push_pass_for_obj": push_pass_for_obj,
+                "sprites_collide": sprites_collide,
+                "push_result": push_result, "bbox_overlap": bbox_overlap,
+                "is_win": is_win, "active_idx": active_idx,
+                "init_positions": init_positions, "pad": pad, "sc": sc,
+                "container_goals": object_goals,  # backward compat alias
+            }
+
+        def _bfs_level(model, bfs_deadline):
+            """Full multi-container BFS with push support; returns plan or None."""
+            n = model["n"]
+            n_containers = model["n_containers"]
+            c_sizes = model["c_sizes"]
+            passable_for_obj = model["passable_for_obj"]
+            push_result_fn = model["push_result"]
+            sprites_collide_fn = model["sprites_collide"]
+            is_win_fn = model["is_win"]
+            aidx0 = model["active_idx"]
+            init_pos = model["init_positions"]
+            pad = model["pad"]
+            sc = model["sc"]
+
+            if is_win_fn(init_pos):
+                return []
+
+            init_state = (aidx0, init_pos)
+            parent: dict = {init_state: None}
+            q = deque([init_state])
+            found = None
+            MAX_NODES = 200000
+
+            while q and found is None:
+                if time.monotonic() >= bfs_deadline or len(parent) > MAX_NODES:
+                    return None
+                aidx, positions = q.popleft()
+                ax, ay = positions[aidx]
+
+                for label, dx, dy in DIRS:
+                    nax, nay = ax + dx, ay + dy
+                    push_j = -1
+                    blocked = False
+                    for j in range(n):
+                        if j == aidx:
+                            continue
+                        bx, by = positions[j]
+                        if sprites_collide_fn(nax, nay, aidx, bx, by, j):
+                            if push_j >= 0:
+                                blocked = True
+                                break
+                            push_j = j
+                    if blocked:
+                        continue
+
+                    if push_j >= 0:
+                        pj_x, pj_y = positions[push_j]
+                        pf = push_result_fn(pj_x, pj_y, push_j, dx, dy)
+                        if pf == (pj_x, pj_y):
+                            continue
+                        ok = all(
+                            not sprites_collide_fn(pf[0], pf[1], push_j,
+                                                   positions[j2][0], positions[j2][1], j2)
+                            for j2 in range(n) if j2 != aidx and j2 != push_j
+                        )
+                        if not ok:
+                            continue
+                        new_pos = list(positions)
+                        new_pos[push_j] = pf
+                        new_positions = tuple(new_pos)
+                        new_state = (aidx, new_positions)
+                        if new_state not in parent:
+                            parent[new_state] = ((aidx, positions), label)
+                            if is_win_fn(new_positions):
+                                found = new_state; break
+                            q.append(new_state)
+                    else:
+                        if (nax, nay) not in passable_for_obj[aidx]:
+                            continue
+                        new_pos = list(positions)
+                        new_pos[aidx] = (nax, nay)
+                        new_positions = tuple(new_pos)
+                        new_state = (aidx, new_positions)
+                        if new_state not in parent:
+                            parent[new_state] = ((aidx, positions), label)
+                            if is_win_fn(new_positions):
+                                found = new_state; break
+                            q.append(new_state)
+                if found:
+                    break
+
+                for j in range(n_containers):  # only containers can be clicked
+                    if j == aidx:
+                        continue
+                    px_j, py_j = positions[j]
+                    click_item = {"x": px_j * sc + pad, "y": py_j * sc + pad}
+                    new_state = (j, positions)
+                    if new_state not in parent:
+                        parent[new_state] = ((aidx, positions), click_item)
+                        if is_win_fn(positions):
+                            found = new_state; break
+                        q.append(new_state)
+                if found:
+                    break
+
+            if found is None:
+                return None
+            path = []
+            state = found
+            while parent[state] is not None:
+                prev, action = parent[state]
+                path.append(action)
+                state = prev
+            path.reverse()
+            return path
+
+        def _sequential_level(model):
+            """Move each container to its assigned goal one at a time (no push)."""
+            n = model["n"]
+            n_containers = model["n_containers"]
+            c_sizes = model["c_sizes"]
+            passable_for_obj = model["passable_for_obj"]
+            sprites_collide_fn = model["sprites_collide"]
+            is_win_fn = model["is_win"]
+            aidx0 = model["active_idx"]
+            init_pos = model["init_positions"]
+            pad = model["pad"]
+            sc = model["sc"]
+            container_goals = model["container_goals"]
+
+            if is_win_fn(init_pos):
+                return []
+            if any(container_goals[i] is None for i in range(n_containers)):
+                return None
+
+            positions = list(init_pos)
+            aidx = aidx0
+            plan = []
+
+            # Order: containers that need to move (not balls), sorted by goal distance
+            order = sorted(
+                [i for i in range(n_containers) if positions[i] != container_goals[i]],
+                key=lambda i: (abs(container_goals[i][0] - positions[i][0]) +
+                               abs(container_goals[i][1] - positions[i][1])),
+                reverse=True,
+            )
+
+            for k in order:
+                if time.monotonic() >= global_deadline:
+                    return None
+                goal_k = container_goals[k]
+                if positions[k] == goal_k:
+                    continue
+
+                # Click to select container k
+                if aidx != k:
+                    click = {"x": positions[k][0] * sc + pad,
+                             "y": positions[k][1] * sc + pad}
+                    plan.append(click)
+                    aidx = k
+
+                passable_k = passable_for_obj[k]
+
+                start_k = positions[k]
+                # BFS for single container
+                parent_k: dict = {start_k: None}
+                q_k = deque([start_k])
+                found_k = None
+
+                while q_k:
+                    if time.monotonic() >= global_deadline:
+                        return None
+                    x, y = q_k.popleft()
+                    if (x, y) == goal_k:
+                        found_k = (x, y)
+                        break
+                    for label, dx, dy in DIRS:
+                        nx, ny = x + dx, y + dy
+                        if (nx, ny) in parent_k or (nx, ny) not in passable_k:
+                            continue
+                        if any(sprites_collide_fn(nx, ny, k, positions[j][0], positions[j][1], j)
+                               for j in range(n) if j != k):
+                            continue
+                        parent_k[(nx, ny)] = ((x, y), label)
+                        q_k.append((nx, ny))
+
+                if found_k is None:
+                    return None  # path blocked; this approach can't solve this level
+
+                path_k = []
+                pos = found_k
+                while parent_k[pos] is not None:
+                    prev, label = parent_k[pos]
+                    path_k.append(label)
+                    pos = prev
+                path_k.reverse()
+                plan.extend(path_k)
+                positions[k] = goal_k
+
+            return plan if is_win_fn(tuple(positions)) else None
+
+        def _staged_solver(model, staged_deadline):
+            """Phase 1: sequential for containers with direct paths.
+            Phase 2: A*+push BFS for containers needing cross-zone movement."""
+            import heapq as _heapq
+            n = model["n"]
+            n_containers = model["n_containers"]
+            c_sizes = model["c_sizes"]
+            passable_for_obj = model["passable_for_obj"]
+            push_result_fn = model["push_result"]
+            sprites_collide_fn = model["sprites_collide"]
+            is_win_fn = model["is_win"]
+            aidx0 = model["active_idx"]
+            init_pos = model["init_positions"]
+            container_goals = model["container_goals"]
+            pad = model["pad"]
+            sc = model["sc"]
+
+            if is_win_fn(init_pos):
+                return []
+            # Only require goals for containers in staged solver
+            if any(container_goals[i] is None for i in range(n_containers)):
+                return None
+
+            positions = list(init_pos)
+            aidx = aidx0
+            plan = []
+            solved = [False] * n
+
+            # Phase 1: sequential BFS (no push) for each container only (balls need push)
+            order = sorted(
+                range(n_containers),
+                key=lambda i: (abs(container_goals[i][0] - positions[i][0]) +
+                               abs(container_goals[i][1] - positions[i][1])),
+            )
+            for k in order:
+                if time.monotonic() >= staged_deadline:
+                    return None
+                goal_k = container_goals[k]
+                if positions[k] == goal_k:
+                    solved[k] = True
+                    continue
+                passable_k = passable_for_obj[k]
+                start_k = positions[k]
+                par_k: dict = {start_k: None}
+                q_k = deque([start_k])
+                found_k = None
+                while q_k:
+                    x, y = q_k.popleft()
+                    if (x, y) == goal_k:
+                        found_k = (x, y)
+                        break
+                    for label, dx, dy in DIRS:
+                        nx, ny = x + dx, y + dy
+                        if (nx, ny) in par_k or (nx, ny) not in passable_k:
+                            continue
+                        if any(sprites_collide_fn(nx, ny, k, positions[j][0], positions[j][1], j)
+                               for j in range(n) if j != k):
+                            continue
+                        par_k[(nx, ny)] = ((x, y), label)
+                        q_k.append((nx, ny))
+                if found_k is None:
+                    continue  # defer to phase 2
+                if aidx != k:
+                    plan.append({"x": positions[k][0] * sc + pad,
+                                 "y": positions[k][1] * sc + pad})
+                    aidx = k
+                path_k: list = []
+                pos = found_k
+                while par_k[pos] is not None:
+                    prev, label = par_k[pos]
+                    path_k.append(label)
+                    pos = prev
+                path_k.reverse()
+                plan.extend(path_k)
+                positions[k] = goal_k
+                solved[k] = True
+
+            if all(solved):
+                return plan if is_win_fn(tuple(positions)) else None
+
+            # Phase 2: A*+push BFS for deferred containers
+            deferred = [k for k in range(n) if not solved[k]]
+            d_n = len(deferred)
+            d_goals = [container_goals[k] for k in deferred]
+            fixed_ki = [k for k in range(n) if solved[k]]
+            d_init = tuple(positions[k] for k in deferred)
+            d_aidx0 = deferred.index(aidx) if aidx in deferred else 0
+
+            def d_h(dp):
+                return sum((abs(dp[i][0] - d_goals[i][0]) +
+                            abs(dp[i][1] - d_goals[i][1])) // STEP
+                           for i in range(d_n))
+
+            def d_win(dp):
+                return all(dp[i] == d_goals[i] for i in range(d_n))
+
+            d_init_st = (d_aidx0, d_init)
+            d_g: dict = {d_init_st: 0}
+            d_par2: dict = {d_init_st: None}
+            h0 = d_h(d_init)
+            heap = [(h0, 0, 0, d_init_st)]
+            d_found = None
+            ctr = [0]
+            MAX_D = 2000000
+
+            while heap and d_found is None:
+                if time.monotonic() >= staged_deadline or len(d_g) > MAX_D:
+                    return None
+                f, g, _, d_st = _heapq.heappop(heap)
+                if g > d_g.get(d_st, 10**9):
+                    continue
+                d_ai, dp = d_st
+                ax, ay = dp[d_ai]
+                gi = deferred[d_ai]  # global index of active deferred sprite
+
+                for label, dx, dy in DIRS:
+                    nax, nay = ax + dx, ay + dy
+                    push_j = -1
+                    blocked = False
+                    for j in range(d_n):
+                        if j == d_ai:
+                            continue
+                        gj = deferred[j]
+                        if sprites_collide_fn(nax, nay, gi, dp[j][0], dp[j][1], gj):
+                            if push_j >= 0:
+                                blocked = True; break
+                            push_j = j
+                    if blocked:
+                        continue
+                    if any(sprites_collide_fn(nax, nay, gi, positions[ki][0], positions[ki][1], ki)
+                           for ki in fixed_ki):
+                        continue
+
+                    if push_j >= 0:
+                        pjx, pjy = dp[push_j]
+                        gj = deferred[push_j]
+                        pf = push_result_fn(pjx, pjy, gj, dx, dy)
+                        if pf == (pjx, pjy):
+                            continue
+                        if any(sprites_collide_fn(pf[0], pf[1], gj, positions[ki][0], positions[ki][1], ki)
+                               for ki in fixed_ki):
+                            continue
+                        ok = all(
+                            not sprites_collide_fn(pf[0], pf[1], gj,
+                                                   dp[j2][0], dp[j2][1], deferred[j2])
+                            for j2 in range(d_n) if j2 != d_ai and j2 != push_j
+                        )
+                        if not ok:
+                            continue
+                        ndp = list(dp); ndp[push_j] = pf; ndp = tuple(ndp)
+                    else:
+                        if (nax, nay) not in passable_for_obj[gi]:
+                            continue
+                        ndp = list(dp); ndp[d_ai] = (nax, nay); ndp = tuple(ndp)
+
+                    ns = (d_ai, ndp)
+                    ng = g + 1
+                    if ng < d_g.get(ns, 10**9):
+                        d_g[ns] = ng
+                        d_par2[ns] = (d_st, label)
+                        if d_win(ndp):
+                            d_found = ns; break
+                        ctr[0] += 1
+                        _heapq.heappush(heap, (ng + d_h(ndp), ng, ctr[0], ns))
+                if d_found:
+                    break
+
+                # Click only deferred containers (not balls)
+                for j in range(d_n):
+                    if j == d_ai:
+                        continue
+                    if deferred[j] >= n_containers:  # skip balls
+                        continue
+                    click = {"x": dp[j][0] * sc + pad, "y": dp[j][1] * sc + pad}
+                    ns = (j, dp)
+                    ng = g + 1
+                    if ng < d_g.get(ns, 10**9):
+                        d_g[ns] = ng
+                        d_par2[ns] = (d_st, click)
+                        if d_win(dp):
+                            d_found = ns; break
+                        ctr[0] += 1
+                        _heapq.heappush(heap, (ng + d_h(dp), ng, ctr[0], ns))
+                if d_found:
+                    break
+
+            if d_found is None:
+                return None
+
+            d_path: list = []
+            st = d_found
+            while d_par2[st] is not None:
+                prev, act = d_par2[st]
+                d_path.append(act)
+                st = prev
+            d_path.reverse()
+
+            # Add click to select first deferred container if needed
+            if aidx not in deferred:
+                plan.append({"x": positions[deferred[d_aidx0]][0] * sc + pad,
+                             "y": positions[deferred[d_aidx0]][1] * sc + pad})
+
+            plan.extend(d_path)
+
+            # Verify final win
+            final_d_pos = d_found[1]
+            final_positions = list(positions)
+            for i, k in enumerate(deferred):
+                final_positions[k] = final_d_pos[i]
+            return plan if is_win_fn(tuple(final_positions)) else None
+
+        def _astar_level(model, astar_deadline):
+            """Full n-container A* with push support and BFS heuristic."""
+            import heapq as _heapq
+            n = model["n"]
+            n_containers = model["n_containers"]
+            c_sizes = model["c_sizes"]
+            passable_for_obj = model["passable_for_obj"]
+            push_pass_for_obj = model["push_pass_for_obj"]
+            push_result_fn = model["push_result"]
+            sprites_collide_fn = model["sprites_collide"]
+            is_win_fn = model["is_win"]
+            aidx0 = model["active_idx"]
+            init_pos = model["init_positions"]
+            object_goals = model["container_goals"]
+            pad = model["pad"]
+            sc = model["sc"]
+
+            if is_win_fn(init_pos):
+                return []
+            # Only require goals for containers; balls may have None goals if no ball targets
+            if any(object_goals[i] is None for i in range(n_containers)):
+                return None
+
+            # Precompute BFS distances from each goal in push_pass_for_obj
+            dist_table: dict = {}
+            for i in range(n):
+                gi = object_goals[i]
+                if gi is None:
+                    continue
+                pp = push_pass_for_obj[i]
+                bfs_d: dict = {gi: 0}
+                bfs_q: deque = deque([gi])
+                while bfs_q:
+                    cx, cy = bfs_q.popleft()
+                    cd = bfs_d[(cx, cy)]
+                    for _, ddx, ddy in DIRS:
+                        nb = (cx + ddx, cy + ddy)
+                        if nb not in bfs_d and nb in pp:
+                            bfs_d[nb] = cd + 1
+                            bfs_q.append(nb)
+                dist_table[i] = bfs_d
+
+            def h(pos):
+                total = 0
+                for i, p in enumerate(pos):
+                    dtab = dist_table.get(i, {})
+                    d = dtab.get(p)
+                    if d is not None:
+                        total += d // PUSH_FRAMES if i >= n_containers else d
+                    elif object_goals[i] is not None:
+                        gx, gy = object_goals[i]
+                        total += (abs(p[0] - gx) + abs(p[1] - gy)) // STEP
+                return total
+
+            init_st = (aidx0, init_pos)
+            d_g: dict = {init_st: 0}
+            d_par: dict = {init_st: None}
+            ctr = [0]
+            heap = [(h(init_pos), 0, 0, init_st)]
+            found = None
+            MAX_NODES = 3000000
+
+            while heap and found is None:
+                if time.monotonic() >= astar_deadline or len(d_g) > MAX_NODES:
+                    return None
+                f, g, _, st = _heapq.heappop(heap)
+                if g > d_g.get(st, 10**9):
+                    continue
+                aidx, positions = st
+                ax, ay = positions[aidx]
+
+                for label, dx, dy in DIRS:
+                    nax, nay = ax + dx, ay + dy
+                    push_j = -1
+                    blocked = False
+                    for j in range(n):
+                        if j == aidx:
+                            continue
+                        if sprites_collide_fn(nax, nay, aidx,
+                                              positions[j][0], positions[j][1], j):
+                            if push_j >= 0:
+                                blocked = True; break
+                            push_j = j
+                    if blocked:
+                        continue
+
+                    if push_j >= 0:
+                        pjx, pjy = positions[push_j]
+                        pf = push_result_fn(pjx, pjy, push_j, dx, dy)
+                        if pf == (pjx, pjy):
+                            continue
+                        ok = all(
+                            not sprites_collide_fn(pf[0], pf[1], push_j,
+                                                   positions[j2][0], positions[j2][1], j2)
+                            for j2 in range(n) if j2 != aidx and j2 != push_j
+                        )
+                        if not ok:
+                            continue
+                        np2 = list(positions); np2[push_j] = pf
+                        new_pos = tuple(np2)
+                    else:
+                        if (nax, nay) not in passable_for_obj[aidx]:
+                            continue
+                        np2 = list(positions); np2[aidx] = (nax, nay)
+                        new_pos = tuple(np2)
+
+                    ns = (aidx, new_pos)
+                    ng = g + 1
+                    if ng < d_g.get(ns, 10**9):
+                        d_g[ns] = ng
+                        d_par[ns] = (st, label)
+                        if is_win_fn(new_pos):
+                            found = ns; break
+                        ctr[0] += 1
+                        _heapq.heappush(heap, (ng + h(new_pos), ng, ctr[0], ns))
+                if found:
+                    break
+
+                for j in range(n_containers):  # only containers can be clicked
+                    if j == aidx:
+                        continue
+                    click = {"x": positions[j][0] * sc + pad, "y": positions[j][1] * sc + pad}
+                    ns = (j, positions)
+                    ng = g + 1
+                    if ng < d_g.get(ns, 10**9):
+                        d_g[ns] = ng
+                        d_par[ns] = (st, click)
+                        if is_win_fn(positions):
+                            found = ns; break
+                        ctr[0] += 1
+                        _heapq.heappush(heap, (ng + h(positions), ng, ctr[0], ns))
+                if found:
+                    break
+
+            if found is None:
+                return None
+
+            path: list = []
+            st = found
+            while d_par[st] is not None:
+                prev, act = d_par[st]
+                path.append(act)
+                st = prev
+            path.reverse()
+            return path
+
+        # Multi-level: one deepcopy upfront, then execute plans on sim
+        gc.disable()
+        try:
+            sim = copy.deepcopy(raw_env)
+        finally:
+            gc.enable()
+
+        total_plan = []
+        cur_lc = start_levels
+        clean_levels = getattr(sim._game, "_clean_levels", None) or []
+        ws = len(clean_levels) if clean_levels else 7
+
+        while cur_lc < ws:
+            if time.monotonic() >= global_deadline:
+                break
+            lvl = sim._game.current_level
+            if not lvl.get_sprites_by_tag("0022vrxelxosfy") or \
+               not lvl.get_sprites_by_tag("0010xzmuziohuf"):
+                break
+
+            model = _build_level_model(sim._game)
+            if model is None:
+                break
+
+            # BFS (fast for 2 containers), staged solver (factored for ball levels),
+            # then full A* with heuristic, then sequential fallback.
+            bfs_t = min(global_deadline, time.monotonic() + 5.0)
+            level_plan = _bfs_level(model, bfs_t)
+            if level_plan is None:
+                # Staged: move containers first (sequential), then A*+push for balls only.
+                # Much smaller state space when there are balls (491^2 vs 491^3).
+                staged_t = min(global_deadline, time.monotonic() + 20.0)
+                level_plan = _staged_solver(model, staged_t)
+            if level_plan is None:
+                astar_t = min(global_deadline, time.monotonic() + 45.0)
+                level_plan = _astar_level(model, astar_t)
+            if level_plan is None:
+                level_plan = _sequential_level(model)
+            if level_plan is None:
+                break
+
+            for item in level_plan:
+                if isinstance(item, str):
+                    obs = sim.step(kb_enum[item])
+                else:
+                    obs = sim.step(a6, data=item)
+                new_lc = int(getattr(obs, "levels_completed", 0) or 0)
+                if new_lc > cur_lc:
+                    cur_lc = new_lc
+                    break
+
+            total_plan.extend(level_plan)
+
+        return total_plan if total_plan else None
+
+    def _cursor_maze_solver(self, raw_env, all_actions, start_levels, global_deadline) -> list | None:
+        """For cursor-navigates-maze with button-cycle-tiles games (dc22-style).
+
+        Detection: game has qnnpcoyzd (cursor, tag 'jfva') and hfuqkxulm (target, tag 'goknoi').
+        Keyboard ACTION1-4 move cursor by 2px per step, constrained to INTANGIBLE tiles.
+        Clicking buezna+sys_click buttons cycles tovemc tile interaction modes (opens/closes paths).
+        State key: (cursor_x, cursor_y, frozenset of INTANGIBLE tovemc (x, y, name) tuples).
+        Returns mixed plan: strings for keyboard, dicts for click.
+        """
+        import time
+        from collections import deque
+
+        if time.monotonic() >= global_deadline:
+            return None
+
+        game = getattr(raw_env, "_game", None)
+        if game is None:
+            return None
+
+        cursor = getattr(game, "qnnpcoyzd", None)
+        target = getattr(game, "hfuqkxulm", None)
+        if cursor is None or target is None:
+            return None
+        if "jfva" not in getattr(cursor, "tags", []):
+            return None
+        if "goknoi" not in getattr(target, "tags", []):
+            return None
+
+        by_name = {getattr(a, "name", ""): a for a in all_actions}
+        kb_pairs = [(nm, by_name[nm]) for nm in ("ACTION1", "ACTION2", "ACTION3", "ACTION4") if nm in by_name]
+        if not kb_pairs:
+            return None
+        try:
+            from arcengine.enums import GameAction as _GameAction
+            click_enum = _GameAction.ACTION6
+            from arcengine import InteractionMode as _IM
+            INTANGIBLE_VAL = _IM.INTANGIBLE
+            REMOVED_VAL = _IM.REMOVED
+        except ImportError:
+            return None
+
+        scale = self.perception.camera_scale(raw_env)
+
+        def get_state_key(env_snap):
+            g = env_snap._game
+            c = getattr(g, "qnnpcoyzd", None)
+            if c is None:
+                return None
+            lv = g.current_level
+            sprs = getattr(lv, "_sprites", [])
+            tovemc = frozenset(
+                (s._x, s._y, s.name)
+                for s in sprs
+                if "tovemc" in getattr(s, "tags", [])
+                and getattr(s, "_interaction", 0) == INTANGIBLE_VAL
+            )
+            cam = getattr(g, "camera", None)
+            cam_x = getattr(cam, "x", 0) if cam else 0
+            cam_y = getattr(cam, "y", 0) if cam else 0
+            return (c._x, c._y, cam_x, cam_y, tovemc)
+
+        def get_click_candidates(env_snap):
+            g = env_snap._game
+            lv = g.current_level
+            sprs = getattr(lv, "_sprites", [])
+            cam = getattr(g, "camera", None)
+            cam_x = getattr(cam, "x", 0) if cam else 0
+            cam_y = getattr(cam, "y", 0) if cam else 0
+            # Camera letterbox: game renders in a (64 × cam.height) viewport
+            # centered in the 64×64 display, adding (64-cam.height)//2 top padding.
+            cam_h = getattr(cam, "height", 64) if cam else 64
+            letterbox_y = (64 - cam_h) // 2
+            clicks = []
+            seen_xy: set = set()
+            for s in sprs:
+                tags = getattr(s, "tags", [])
+                if "sys_click" not in tags:
+                    continue
+                if getattr(s, "_interaction", 0) == REMOVED_VAL:
+                    continue
+                gx = s._x + s.width // 2
+                gy = s._y + s.height // 2
+                dx = int((gx - cam_x) * scale)
+                dy = int((gy - cam_y) * scale) + letterbox_y
+                key = (dx, dy)
+                if key not in seen_xy:
+                    seen_xy.add(key)
+                    clicks.append({"x": dx, "y": dy})
+            return clicks
+
+        init_sk = get_state_key(raw_env)
+        if init_sk is None:
+            return None
+
+        queue: deque = deque([(copy.deepcopy(raw_env), [])])
+        visited: set = {init_sk}
+        found = None
+        MAX_NODES = 3000
+        nodes = 0
+
+        gc.disable()
+        try:
+            while queue and nodes < MAX_NODES:
+                if time.monotonic() >= global_deadline:
+                    return None
+                env_cur, plan = queue.popleft()
+                nodes += 1
+
+                for label, ga in kb_pairs:
+                    en = copy.deepcopy(env_cur)
+                    ob = en.step(ga)
+                    lc = int(getattr(ob, "levels_completed", 0) or 0)
+                    if lc > start_levels:
+                        found = plan + [label]
+                        break
+                    g2 = en._game
+                    if getattr(g2, "guspipewt", False):
+                        del en
+                        continue
+                    sk = get_state_key(en)
+                    if sk is None or sk in visited:
+                        del en
+                        continue
+                    visited.add(sk)
+                    queue.append((en, plan + [label]))
+                if found:
+                    break
+
+                for click_data in get_click_candidates(env_cur):
+                    en = copy.deepcopy(env_cur)
+                    ob = en.step(click_enum, data=click_data)
+                    lc = int(getattr(ob, "levels_completed", 0) or 0)
+                    if lc > start_levels:
+                        found = plan + [click_data]
+                        break
+                    g2 = en._game
+                    if getattr(g2, "guspipewt", False):
+                        del en
+                        continue
+                    sk = get_state_key(en)
+                    if sk is None or sk in visited:
+                        del en
+                        continue
+                    visited.add(sk)
+                    queue.append((en, plan + [click_data]))
+                if found:
+                    break
+        finally:
+            gc.enable()
+        gc.collect()
         return found

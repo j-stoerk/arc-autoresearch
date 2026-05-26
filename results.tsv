@@ -64,3 +64,5 @@ a288f80	0.904615	9.7	keep	ball_routing_solver: r11l solved via checkpoint-centro
 8af178a	0.932308	10.0	keep	checkers_jump_solver: lf52 solved via 4-jump analytical BFS (8 clicks vs 32 human); perfect RHAE; 12.3s cached
 a...	0.953846	10.7	keep	undoing_maze_solver: g50t solved via ghost-aware BFS (UNDO creates ghost clone; state key includes ghost positions+moves; 17 steps vs 78 human); 61.6s first run (cached)
 HEAD	0.960000	11.3	keep	inverted_platformer_solver: bp35 solved via spring-hop analytical BFS (remove blocking spring + launch; 15 actions vs 21 human); <1ms cached
+HEAD	0.984615	11.8	keep	nested_container_solver: ka59 solved via pixel-level collision (ball has transparent corners; bounding-box model blocked valid moves; pixel-aware sprites_collide + staged_solver for 3-object levels); 8.5s cached
+HEAD	1.000000	12.6	keep	cursor_maze_solver: dc22 solved via BFS with button cycling (letterbox offset fix: display_y = grid_y + (64-cam.height)//2; InteractionMode enum comparison; 20 actions vs 59 human); 8s cached
