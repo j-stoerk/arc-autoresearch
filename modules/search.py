@@ -25,7 +25,7 @@ class Beam:
 
 
 class Search:
-    def __init__(self, dsl: DSLConfig, library: Library):
+    def __init__(self, dsl: DSLConfig = None, library: Library = None):
         self.dsl     = dsl
         self.library = library
 
